@@ -1,0 +1,396 @@
+# pv-snapshotter
+
+> [中文文档](./README_CN.md)
+
+A containerd proxy snapshotter that redirects an overlayfs container's writable layer (`upperdir`/`workdir`) to a caller-provided path — for example, a mounted PersistentVolume — so that writes made outside mounted volumes can land on durable storage with zero data-copy overhead.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started)
+  - [Prerequisites](#prerequisites)
+  - [Build](#build)
+  - [containerd Configuration](#containerd-configuration)
+  - [RuntimeClass](#runtimeclass)
+  - [Pod Annotation Reference](#pod-annotation-reference)
+- [DaemonSet Deployment](#daemonset-deployment)
+- [Helm Chart](#helm-chart)
+- [CLI Flags](#cli-flags)
+- [Observability](#observability)
+- [Operational Notes](#operational-notes)
+- [Roadmap](#roadmap)
+- [License](#license)
+
+---
+
+## Overview
+
+`pv-snapshotter` wraps containerd's native overlayfs snapshotter and overrides exactly one method: `Mounts()`. When a container's pod carries the configured upperdir annotation, the snapshotter rewrites the `upperdir=` and `workdir=` overlay mount options to point under a path the caller supplies. When the annotation is absent, every call is a transparent pass-through to native overlayfs.
+
+The effect is that the container's writable layer lives on storage the caller controls (typically a PersistentVolume mounted on the node) instead of containerd's default snapshot directory — with no image commit, no registry round-trip, and no data copied on container start or stop.
+
+### Scope and Boundaries
+
+The snapshotter does one thing and deliberately stays out of everything else:
+
+- **It does** rewrite the overlay `upperdir=`/`workdir=` options to `<provided-path>/upper` and `<provided-path>/work` when the annotation is present, and pass through to native overlayfs otherwise.
+- **It does not** call the Kubernetes API or any CSI driver. It only reads a path from a pod annotation that the caller has already populated.
+- **It does not** provision or mount storage. The provided path must already be a ready mountpoint by the time `Mounts()` runs; if it is not, the mount fails hard rather than silently falling back.
+- **It does not** delete or garbage-collect the contents of the provided path. `Remove()` only cleans up the native snapshot directories; the lifecycle of the backing storage belongs to whoever created it.
+
+Everything beyond mount-option rewriting — provisioning volumes, computing the path, writing the annotation onto the pod, and deciding when to reclaim data — is the responsibility of the caller (for example, an operator or controller that you provide).
+
+---
+
+## How It Works
+
+```
+kubelet                      containerd                   pv-snapshotter
+  │                              │                              │
+  │── attach & mount volume ──►  │  (CSI mounts the volume)    │
+  │                              │                              │
+  │── CRI CreateContainer ──►    │── Prepare(key) ──────────►  │ pass-through to native overlay
+  │                              │                              │
+  │── CRI StartContainer ──►     │── Mounts(key) ───────────►  │ 1. get native overlay mounts
+  │                              │                              │ 2. look up pod annotations via
+  │                              │                              │    the containerd client
+  │                              │                              │ 3. if the annotation is present:
+  │                              │                              │    rewrite upperdir= / workdir=
+  │                              │◄── []mount.Mount ──────────  │    to the provided path
+  │                              │                              │
+  │                         runc executes the overlay mount
+  │                         (upperdir now on the provided path)
+```
+
+**Sequencing guarantee:** kubelet completes volume attachment and mounting before CRI `CreateContainer`, so by the time `Mounts()` is called the volume is already mounted on the node. No race condition.
+
+---
+
+## Architecture
+
+### Proxy Snapshotter (gRPC plugin)
+
+- Serves the containerd snapshots gRPC API on a Unix socket
+- Registered in containerd via `[proxy_plugins.pv-snapshotter]` — no containerd modification required
+- Wraps the native overlayfs snapshotter; all methods delegate by default
+- Only `Mounts()` is modified: it rewrites overlay mount options when the upperdir annotation is present
+
+### Opt-in via RuntimeClass
+
+containerd selects a snapshotter per runtime, not per pod annotation. The only per-pod mechanism is `RuntimeClass → runtime → snapshotter`. Define a containerd runtime that uses `pv-snapshotter` and a matching RuntimeClass; only pods that set that `runtimeClassName` go through it.
+
+```
+Pod.spec.runtimeClassName: pv
+  └─► RuntimeClass handler: pv
+        └─► containerd runtime: pv
+              └─► snapshotter: pv-snapshotter
+```
+
+The snapshotter is orthogonal to `runtime_type`, so it can be paired with any runtime handler (plain `runc`, a GPU runtime, etc.). Existing workloads and RuntimeClasses are untouched.
+
+### Caller-provided Upperdir Path
+
+The path the writable layer is redirected to is supplied by the caller through a pod annotation. The snapshotter reads it at `Mounts()` time and never queries the Kubernetes API or CSI.
+
+A common source is a CSI volume mounted on the node. For example, OpenEBS ZFS LocalPV (which uses no globalmount staging path) mounts directly to:
+
+```
+/var/lib/kubelet/pods/<podUID>/volumes/kubernetes.io~csi/<pvName>/mount
+```
+
+How you compute and write that path is entirely up to you — see [Pod Annotation Reference](#pod-annotation-reference).
+
+### Annotation Resolution
+
+The snapshotter reads annotations from the containerd sandbox container extension `io.cri-containerd.sandbox.metadata`. Workload containers look up their parent sandbox by `SandboxID`.
+
+Three annotation keys (all derived from `--annotation-prefix`):
+
+| Key | Purpose |
+|-----|---------|
+| `<prefix>/upperdir-path` | Literal path to the upperdir root. Takes precedence. |
+| `<prefix>/upperdir-path-template` | Go `text/template` rendered to produce the path. |
+| `<prefix>/var.<VarName>` | Custom variable injected into the template. |
+
+Built-in template variables: `{{.PodUID}}`, `{{.PodName}}`, `{{.PodNamespace}}`.
+
+**Example (path backed by a ZFS LocalPV volume):**
+
+```yaml
+annotations:
+  pv-snapshotter.humble-mun.io/upperdir-path-template: >-
+    /var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount
+  pv-snapshotter.humble-mun.io/var.PVName: pvc-7cb2f1df-8092-4b89-9f19-d2878aa2d3ec
+```
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+| Component | Version |
+|-----------|---------|
+| Linux kernel | ≥ 5.11 (overlayfs on non-root userspace) |
+| containerd | v2.x |
+| Kubernetes | v1.27+ |
+| Go (build only) | 1.26+ |
+| CSI driver | Any driver that mounts block storage (RBD, ZFS LocalPV, local PV…) |
+
+> **Do not use CephFS** as the upperdir backend — small-file metadata performance is poor. Use block devices formatted as ext4 or xfs.
+
+### Build
+
+```bash
+# Build Docker image (amd64, release)
+make build
+
+# Custom arch / repo
+make build ARCH=arm64 REPO=my-registry/pv-snapshotter VERSION=v0.1.0
+
+# Debug build (with DWARF symbols)
+make build DEBUG=true
+```
+
+The resulting image is based on `gcr.io/distroless/static-debian12` (no shell, minimal attack surface).
+
+### containerd Configuration
+
+Add the proxy plugin and a runtime entry to `/etc/containerd/config.toml`:
+
+```toml
+# Register the proxy snapshotter
+[proxy_plugins.pv-snapshotter]
+  type    = "snapshot"
+  address = "/var/run/pv-snapshotter/daemon.sock"
+
+# A runtime that uses pv-snapshotter (paired here with runc)
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.pv]
+  runtime_type = "io.containerd.runc.v2"
+  snapshotter  = "pv-snapshotter"
+```
+
+The `snapshotter` and `runtime_type` settings are orthogonal: to pair pv-snapshotter with a different runtime handler, keep `snapshotter = "pv-snapshotter"` and set `runtime_type`/`options` to that handler's values.
+
+> **Do not** modify `[plugins."io.containerd.grpc.v1.cri".containerd].snapshotter`. pv-snapshotter is introduced exclusively via RuntimeClass.
+
+Restart containerd after editing. pv-snapshotter must be running before containerd starts — see [DaemonSet Deployment](#daemonset-deployment) for ordering.
+
+### RuntimeClass
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: pv
+handler: pv
+```
+
+Apply with:
+
+```bash
+kubectl apply -f runtimeclass.yaml
+```
+
+Pods opt in by setting:
+
+```yaml
+spec:
+  runtimeClassName: pv
+```
+
+### Pod Annotation Reference
+
+The annotations below must be computed and written onto the pod by the caller (an operator, controller, or admission webhook that you provide) before the pod is created. The snapshotter only consumes them.
+
+```yaml
+metadata:
+  annotations:
+    # Option 1 — literal path (highest precedence)
+    pv-snapshotter.humble-mun.io/upperdir-path: /var/lib/kubelet/pods/abc123/volumes/kubernetes.io~csi/pvc-xyz/mount
+
+    # Option 2 — Go template (rendered at Mounts() time)
+    pv-snapshotter.humble-mun.io/upperdir-path-template: >-
+      /var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount
+    pv-snapshotter.humble-mun.io/var.PVName: pvc-7cb2f1df-8092-4b89-9f19-d2878aa2d3ec
+```
+
+Pods without either annotation pass through transparently to native overlayfs.
+
+---
+
+## DaemonSet Deployment
+
+The DaemonSet runs `pv-snapshotter` on each node. Its own Pods **must not** set `runtimeClassName: pv` — otherwise the snapshotter would depend on itself to start.
+
+Required `hostPath` mounts:
+
+| Host path | Mount path in container | Purpose |
+|-----------|------------------------|---------|
+| `/var/run/pv-snapshotter/` | `/var/run/pv-snapshotter/` | gRPC socket |
+| `/run/containerd/containerd.sock` | `/run/containerd/containerd.sock` | containerd client |
+| `/var/lib/kubelet` | `/var/lib/kubelet` | make CSI mount paths visible |
+
+**Startup ordering:** containerd connects to the proxy plugin at startup and does **not** automatically reconnect if the plugin is unavailable. Ensure pv-snapshotter starts before containerd:
+
+- `systemd`: use `After=` / `Requires=` directives
+- `DaemonSet upgrade`: cordon → drain workload Pods → restart pv-snapshotter + containerd → uncordon
+
+**Failure semantics:** if `pv-snapshotter` is unavailable, Pods with `runtimeClassName: pv` will fail to start. They will **not** silently fall back to plain overlayfs — this is intentional.
+
+---
+
+## Helm Chart
+
+> 🚧 The Helm chart is under active development and will be released in an upcoming version.
+
+The chart will cover:
+
+- DaemonSet with correct `hostPath` mounts and `tolerations`
+- RBAC for node-scoped operations
+- containerd config patch via `initContainer` (or `configMap` + node-config-operator)
+- RuntimeClass creation
+- `nodeSelector` / `affinity` for targeted rollout
+- Configurable annotation prefix and socket paths
+
+Track progress in the [Issues](../../issues) tab.
+
+---
+
+## CLI Flags
+
+All flags can also be set via environment variables (uppercase, `_`-separated, prefixed with `DAEMON_`).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--unix-socket-path` | `/var/run/pv-snapshotter/daemon.sock` | gRPC listener socket path |
+| `--containerd-socket` | `/run/containerd/containerd.sock` | containerd client socket |
+| `--annotation-prefix` | `pv-snapshotter.humble-mun.io` | DNS subdomain prefix for Pod annotations (RFC 1123, no reserved domains) |
+| `--overlay-snapshotter.root-path` | `/var/lib/containerd` | Native overlay snapshotter root |
+| `--overlay-snapshotter.upper-dir-label` | `false` | Stamp `containerd.io/snapshot/overlay.upperdir` label on snapshots |
+| `--overlay-snapshotter.sync-remove` | `false` | Synchronous snapshot removal |
+| `--overlay-snapshotter.slow-chown` | `false` | Slow chown for ID-mapped mounts |
+| `--overlay-snapshotter.mount-options` | `[]` | Extra mount options passed to overlayfs (**never add `volatile`**) |
+
+> ⚠️ **Never add `volatile`** to `--overlay-snapshotter.mount-options`. It causes `upperdir` data loss on unclean shutdown, directly contradicting the persistence semantics of this project.
+
+---
+
+## Observability
+
+### Verify proxy plugin registration
+
+```bash
+ctr plugins ls | grep pv-snapshotter
+# Expected: io.containerd.snapshotter.v1  pv-snapshotter  ok
+```
+
+### Test directly with ctr (bypass K8s and CRI)
+
+```bash
+ctr --namespace=k8s.io snapshots --snapshotter=pv-snapshotter ls
+ctr --namespace=k8s.io run --snapshotter=pv-snapshotter --rm -t docker.io/library/alpine:latest test sh
+```
+
+### Confirm the redirected upperdir is active
+
+```bash
+# On the node — find the container's overlay mount
+findmnt -t overlay
+# Verify upperdir= points to the provided path, not /var/lib/containerd/snapshots/...
+```
+
+### Log verbosity
+
+```bash
+# Pod lifecycle events (method calls, resolver steps, redirect routing)
+--v=4
+
+# Also dump raw sandbox metadata JSON
+--v=5
+
+# Correlate all logs for a specific container
+grep 'key="k8s.io/31/4856f54d' /var/log/pv-snapshotter.log
+```
+
+### Confirm state persistence
+
+```bash
+# 1. Write a file inside the container
+kubectl exec -it <pod> -- sh -c 'echo hello > /root/test.txt'
+
+# 2. Delete the pod (its writable layer would normally be lost)
+kubectl delete pod <pod>
+
+# 3. Recreate a pod that references the same backing path
+kubectl apply -f pod.yaml
+
+# 4. Verify the file is still there
+kubectl exec -it <pod> -- cat /root/test.txt
+# hello
+```
+
+---
+
+## Operational Notes
+
+### Data Lifecycle Is the Caller's Responsibility
+
+`Remove()` only cleans up the native overlay snapshot directories under the snapshotter root. The snapshotter never deletes the contents of the caller-provided path. If you need stop-without-loss versus destroy-and-reclaim semantics, implement that distinction in the component that owns the backing storage; the snapshotter does not decide it.
+
+### upper/ and work/ Must Share a Filesystem
+
+The snapshotter creates `upper/` and `work/` under the provided path. overlayfs requires both to be on the same filesystem — ensure the provided path is a single mounted volume.
+
+### Storage Resize
+
+If the backing volume is a CSI PVC, resize follows the standard CSI expansion path:
+
+```bash
+kubectl patch pvc <name> -p '{"spec":{"resources":{"requests":{"storage":"20Gi"}}}}'
+```
+
+The CSI driver resizes the block device; `resize2fs`/`xfs_growfs` runs online. No container restart is required.
+
+### Keep the Backing Path Out of Reach
+
+The provided path is the raw overlay upper directory. If you expose it inside the container (for example, by mounting the PVC at a dedicated path), prevent workloads from writing to it directly — enforce with AppArmor / SELinux if needed.
+
+### `nerdctl commit`
+
+A container backed by this snapshotter can be committed like any other:
+
+```bash
+nerdctl --namespace=k8s.io --snapshotter=pv-snapshotter commit <container> <image>
+```
+
+### Node Restart Recovery
+
+After pv-snapshotter restarts, existing running containers still hold their overlay mounts (runc holds them). Re-created Pods that reference the same backing path correctly re-attach on the next `Mounts()` call.
+
+---
+
+## Roadmap
+
+### Production Hardening (next)
+
+- [ ] Configurable cleanup behavior on `Remove()` (forget binding vs. reclaim)
+- [ ] Node restart recovery verification
+- [ ] Storage expansion end-to-end testing
+- [ ] Error recovery: mount failure, missing parent snapshot, CSI not ready
+- [ ] GC coordination: overlay metadata.db cleanup vs. backing storage lifecycle
+
+### Future
+
+- [ ] Helm chart for DaemonSet deployment
+- [ ] Metrics endpoint (Prometheus) for mount latency and resolution errors
+- [ ] Support for Ceph RBD globalmount staging path (automatic path detection)
+- [ ] Multi-arch image builds (arm64)
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE) for details.
