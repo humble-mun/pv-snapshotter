@@ -1,0 +1,216 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+data:
+  # viper reads /etc/humble-mun/daemon.yaml at startup (configName = "daemon").
+  # http-bind-address opens a plain TCP listener so that kubelet httpGet probes
+  # can reach /healthz and /readyz without needing Unix socket access.
+  # tls-cert-path / tls-key-path are explicitly cleared so that the plain
+  # listener does not attempt to load the default certificate paths.
+  daemon.yaml: |+
+    http-bind-address: 0.0.0.0:8080
+    tls-cert-path: ""
+    tls-key-path: ""
+    unix-socket-path: {{ .Values.unixSocketPath }}
+    containerd-socket: {{ .Values.containerdSocket }}
+    annotation-prefix: {{ .Values.annotationPrefix }}
+    overlay-snapshotter:
+      root-path: {{ .Values.overlaySnapshotter.rootPath }}
+      upper-dir-label: {{ .Values.overlaySnapshotter.upperDirLabel }}
+      sync-remove: {{ .Values.overlaySnapshotter.syncRemove }}
+      slow-chown: {{ .Values.overlaySnapshotter.slowChown }}
+      {{- if .Values.overlaySnapshotter.mountOptions }}
+      mount-options:
+{{ toYaml .Values.overlaySnapshotter.mountOptions | indent 6 }}
+      {{- end }}
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  selector:
+    matchLabels:
+      app: {{ .Release.Name }}
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: {{ .Release.Name }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}
+      # pv-snapshotter does not call the Kubernetes API; disable the service
+      # account token projection to reduce the Pod's attack surface.
+      automountServiceAccountToken: false
+      # hostPID exposes /proc/1/ns/mnt to the init container so that the Go
+      # setns(2) call can enter the host mount namespace and exec systemctl.
+      hostPID: true
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+
+      initContainers:
+      # -----------------------------------------------------------------------
+      # configure-containerd: native sidecar (restartPolicy: Always, K8s ≥ 1.29)
+      #
+      # Lifecycle:
+      #   1. Wait until the pv-snapshotter daemon's /readyz returns 200
+      #      (HTTP over Unix socket).  The daemon must be up first: containerd
+      #      connects to the daemon socket at restart time, so restarting
+      #      containerd before the daemon is ready would be pointless.
+      #   2. Patch /etc/containerd/config.toml (idempotent, sparse append).
+      #   3. If modified: enter host mount namespace via setns(2) + exec
+      #      "systemctl restart containerd".  The process is replaced by
+      #      systemctl; Kubernetes restarts the sidecar, which re-enters at
+      #      step 1 (already-configured path, skips restart).
+      #   4. Block on SIGTERM — keeps the sidecar alive for the Pod lifetime.
+      #
+      # Running as a native sidecar guarantees this container starts before the
+      # main container and is restarted independently if it crashes.
+      # -----------------------------------------------------------------------
+      - name: config
+        image: {{ .Values.image }}
+        # restartPolicy: Always makes this a native sidecar (K8s ≥ 1.29).
+        restartPolicy: Always
+        command:
+        - daemon
+        - config
+        args:
+        - --config-path=/host/etc/containerd/config.toml
+        - --socket-path={{ .Values.unixSocketPath }}
+        - --runtime-class-suffix={{ .Values.containerdConfig.suffix }}
+        {{- if .Values.containerdConfig.runtimeClasses }}
+        - --runtime-classes={{ .Values.containerdConfig.runtimeClasses | join "," }}
+        {{- end }}
+        env:
+        - name: HM_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        volumeMounts:
+        - name: host-etc-containerd
+          mountPath: /host/etc/containerd
+        # pv-snapshotter gRPC socket directory: needed to probe /readyz via Unix socket.
+        - name: socket-dir
+          mountPath: /var/run/pv-snapshotter
+
+      containers:
+      # -----------------------------------------------------------------------
+      # Main container: the pv-snapshotter gRPC daemon.
+      # All configuration is sourced from /etc/humble-mun/daemon.yaml (viper).
+      # -----------------------------------------------------------------------
+      - name: daemon
+        image: {{ .Values.image }}
+        command:
+        - daemon
+        env:
+        - name: HM_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        volumeMounts:
+        # viper config file mounted as a single file via subPath.
+        - name: config
+          mountPath: /etc/humble-mun/daemon.yaml
+          subPath: daemon.yaml
+          readOnly: true
+        # gRPC socket; containerd connects to this host path.
+        - name: socket-dir
+          mountPath: /var/run/pv-snapshotter
+        # containerd client socket used to resolve pod annotations at Mounts() time.
+        # Mount the parent directory (not the socket file itself) so that the
+        # path remains valid across containerd restarts: the daemon deletes and
+        # recreates the socket file, which would break a file-level bind-mount.
+        - name: containerd-run
+          mountPath: /run/containerd
+        # Kubelet volume tree must be visible so CSI mount paths resolve correctly.
+        - name: kubelet-dir
+          mountPath: /var/lib/kubelet
+          mountPropagation: HostToContainer
+        # Native overlay snapshotter root.
+        - name: containerd-root
+          mountPath: {{ .Values.overlaySnapshotter.rootPath }}
+          mountPropagation: HostToContainer
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 2
+          failureThreshold: 30
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 2
+
+      volumes:
+      # viper config file: mounted as a single file via subPath.
+      - name: config
+        configMap:
+          name: {{ .Release.Name }}
+      # Host /etc/containerd — mounted into the configure-containerd init container.
+      - name: host-etc-containerd
+        hostPath:
+          path: /etc/containerd
+          type: DirectoryOrCreate
+      # pv-snapshotter gRPC socket directory (shared with containerd on the host).
+      - name: socket-dir
+        hostPath:
+          path: /var/run/pv-snapshotter
+          type: DirectoryOrCreate
+      # containerd run directory: mounting the directory (not the socket file)
+      # keeps the path valid across containerd restarts.
+      - name: containerd-run
+        hostPath:
+          path: /run/containerd
+          type: Directory
+      # Kubelet volume tree.
+      - name: kubelet-dir
+        hostPath:
+          path: /var/lib/kubelet
+          type: Directory
+      # containerd overlay snapshotter root.
+      - name: containerd-root
+        hostPath:
+          path: {{ .Values.overlaySnapshotter.rootPath }}
+          type: DirectoryOrCreate
+

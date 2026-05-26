@@ -220,9 +220,15 @@ If the upperdir path is not a mountpoint (volume not yet ready), `Mounts()` retu
 pv-snapshotter/
 ├── cmd/
 │   └── daemon/                  # main entrypoint
-│       └── main.go
+│       ├── main.go              # root command (daemon gRPC server)
+│       └── config.go            # "config" subcommand (sidecar lifecycle)
 ├── pkg/
 │   ├── containerd/
+│   │   ├── config/              # containerd config patching + sidecar support (all files: //go:build linux)
+│   │   │   ├── flags.go         # flag constants, RegisterFlags, GetParams, GetSocketPath
+│   │   │   ├── nsenter.go       # RestartContainerd via cgo constructor + re-exec
+│   │   │   ├── patcher.go       # Apply: TOML surgical edit, base-runtime clone
+│   │   │   └── wait.go          # WaitUntilReady: HTTP /readyz over Unix socket
 │   │   └── snapshotter/         # core snapshotter implementation (all files: //go:build linux)
 │   │       ├── service.go       # flags, gRPC service registration, all snapshots.Snapshotter method overrides
 │   │       ├── overlay.go       # native overlay snapshotter construction and config struct
@@ -230,7 +236,15 @@ pv-snapshotter/
 │   │       └── resolver.go      # annotation lookup via containerd client at Mounts() time
 │   └── service/
 │       └── common.go            # service name constant
-├── Dockerfile
+├── charts/
+│   └── pv-snapshotter/          # Helm chart
+│       ├── Chart.yaml
+│       ├── values.yaml
+│       └── templates/
+│           ├── daemonset.yaml   # ConfigMap + DaemonSet (daemon + config sidecar)
+│           ├── rbac.yaml        # ServiceAccount (automountServiceAccountToken: false)
+│           └── runtimeclass.yaml
+├── Dockerfile                   # CGO_ENABLED=1, distroless/base-debian13
 ├── Makefile
 ├── go.mod
 ├── go.sum
@@ -370,6 +384,7 @@ v1.x has no `/v2` suffix and uses `snapshots/overlay` instead of `plugins/snapsh
 - Logging: `go-logr/logr` (not `klog` directly). Logger name conventions: `"snapshotter"`, `"snapshotter.resolver"`
 - All structured log fields use the `"key", value` pattern; never `fmt.Sprintf` structured fields
 - All files in `pkg/containerd/snapshotter/` must carry `//go:build linux`
+- All files in `pkg/containerd/config/` must carry `//go:build linux`
 
 ---
 
@@ -395,7 +410,7 @@ Full annotation propagation path implemented and verified end-to-end:
 - `resolver.go` implemented: sandbox container extension lookup, JSON deserialization, annotation reading
 - Both sandbox path and workload → sandbox path verified working
 
-### Done — Phase 2b: upperdir replacement (CURRENT STATE)
+### Done — Phase 2b: upperdir replacement
 
 upperdir redirection fully implemented and verified:
 
@@ -414,7 +429,21 @@ The caller writes the resolved path into the annotation. For ZFS LocalPV (no glo
 /var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount
 ```
 
-`PodUID` is a built-in template variable; `PVName` is injected via `<prefix>/var.PVName`.
+### Done — Phase 3: Helm chart + containerd config automation (CURRENT STATE)
+
+Full DaemonSet deployment package implemented:
+
+- **`pkg/containerd/config/`** — containerd config patching package:
+  - `patcher.go`: idempotent TOML surgical append; clones base runtime's config subtree (preserving `SystemdCgroup`, `BinaryName`, etc.) and overrides `snapshotter = "pv-snapshotter"`; detects existing sections via `map[string]any` parse, never re-serialises the whole tree
+  - `nsenter.go`: `RestartContainerd()` via cgo `__attribute__((constructor))` + re-exec pattern; the C constructor runs before Go runtime threads start, so `setns(CLONE_NEWNS)` succeeds; gated by `_PV_NSENTER` env var
+  - `wait.go`: `WaitUntilReady()` polls `HTTP GET /readyz` over Unix socket; verbosity decreases from `V(10)` toward `V(1)` as retry count increases
+  - `flags.go`: `RegisterFlags` + `GetParams` + `GetSocketPath`
+- **`cmd/daemon/config.go`** — `config` subcommand lifecycle:
+  1. `WaitUntilReady`: polls daemon `/readyz` via Unix socket HTTP
+  2. `Apply`: patch `config.toml`, clone base runtime config
+  3. `RestartContainerd`: if modified, re-exec via cgo nsenter preamble
+  4. `<-ctx.Done()`: block for Pod lifetime as native sidecar
+- **`charts/pv-snapshotter/`** — complete Helm chart; see Deployment section for details
 
 ---
 
@@ -463,7 +492,7 @@ handler: pv
 ### DaemonSet requirements
 
 - `hostPath` mount for `/var/run/pv-snapshotter/` — socket address must match containerd config
-- `hostPath` mount for `/run/containerd/containerd.sock` — resolver needs this to query container metadata
+- `hostPath` mount for `/run/containerd/` (**directory**, not the socket file) — resolver needs this to query container metadata; mounting the directory keeps the path valid across containerd restarts (a file-level bind-mount becomes stale when containerd deletes and recreates the socket)
 - `hostPath` mount for `/var/lib/kubelet` — required for the CSI mount path to be accessible
 - The DaemonSet's own Pods **must not** set `runtimeClassName: pv`
 - Use `nodeSelector` or tolerations to restrict to target nodes

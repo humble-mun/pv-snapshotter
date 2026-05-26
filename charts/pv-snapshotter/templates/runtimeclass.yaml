@@ -1,0 +1,10 @@
+{{- range .Values.containerdConfig.runtimeClasses }}
+---
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: {{ . }}{{ $.Values.containerdConfig.suffix }}
+  labels:
+    app: {{ $.Release.Name }}
+handler: {{ . }}{{ $.Values.containerdConfig.suffix }}
+{{- end }}

@@ -68,6 +68,7 @@ func newRootCommand() *cobra.Command {
 	}
 
 	init = app.PrepareFlags(service.Name, cmd, snapshotter.RegisterFlags)
+	cmd.AddCommand(newConfigCommand())
 	return cmd
 }
 

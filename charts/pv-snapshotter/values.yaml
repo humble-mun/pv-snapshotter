@@ -1,0 +1,66 @@
+# ---------------------------------------------------------------------------
+# Image
+# ---------------------------------------------------------------------------
+image: harbor-c0a811fc.nip.io/humble-mun/pv-snapshotter:v1.0
+
+# ---------------------------------------------------------------------------
+# pv-snapshotter daemon flags
+# ---------------------------------------------------------------------------
+
+# unixSocketPath is the gRPC listener socket.  Must match the address
+# registered in the containerd config.toml [proxy_plugins.pv-snapshotter].
+unixSocketPath: /var/run/pv-snapshotter/daemon.sock
+
+# containerdSocket is the containerd client socket, used by the snapshotter to
+# resolve pod annotations at Mounts() time.
+containerdSocket: /run/containerd/containerd.sock
+
+# annotationPrefix is the DNS subdomain prefix for all pod annotations read by
+# the snapshotter (RFC 1123 subdomain, no trailing slash, not kubernetes.io/k8s.io).
+annotationPrefix: pv-snapshotter.humble-mun.io
+
+# overlaySnapshotter holds options forwarded to the native overlay snapshotter.
+overlaySnapshotter:
+  rootPath: /var/lib/containerd
+  upperDirLabel: true
+  syncRemove: false
+  slowChown: false
+  # mountOptions is passed verbatim to overlayfs.
+  # WARNING: never add "volatile" — it causes upperdir data loss on unclean shutdown.
+  mountOptions: []
+
+# ---------------------------------------------------------------------------
+# containerd config patching (init container: "config apply")
+# ---------------------------------------------------------------------------
+containerdConfig:
+  # path is the host-side path to config.toml, accessed via the hostPath volume.
+  path: /etc/containerd/config.toml
+
+  # runtimeClasses is the list of *existing* containerd runtime handler names
+  # to extend with a pv-backed variant.
+  #
+  # For each name N a new runtime entry "<N><suffix>" is injected into
+  # config.toml and a matching Kubernetes RuntimeClass is created.
+  #
+  # Example: runtimeClasses: [runc, nvidia]
+  #          suffix: -pv
+  #          → handlers: runc-pv, nvidia-pv
+  #          → RuntimeClasses: runc-pv, nvidia-pv
+  runtimeClasses: []
+
+  # suffix is appended to each base name to form the pv-backed handler name.
+  suffix: -pv
+
+# ---------------------------------------------------------------------------
+# DaemonSet scheduling
+# ---------------------------------------------------------------------------
+affinity: {}
+tolerations:
+- key: node-role.kubernetes.io/control-plane
+  operator: Equal
+  effect: NoSchedule
+# nodeSelector restricts the DaemonSet to specific nodes.
+# Leave empty to deploy on all nodes.
+nodeSelector: {}
+
+priorityClassName: system-node-critical

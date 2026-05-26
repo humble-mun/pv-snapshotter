@@ -154,7 +154,7 @@ make build ARCH=arm64 REPO=my-registry/pv-snapshotter VERSION=v0.1.0
 make build DEBUG=true
 ```
 
-The resulting image is based on `gcr.io/distroless/static-debian12` (no shell, minimal attack surface).
+The resulting image is based on `gcr.io/distroless/base-debian13` (glibc only, no shell, minimal attack surface). CGO is enabled to support the cgo nsenter preamble used for containerd restart.
 
 ### containerd Configuration
 
@@ -230,7 +230,7 @@ Required `hostPath` mounts:
 | Host path | Mount path in container | Purpose |
 |-----------|------------------------|---------|
 | `/var/run/pv-snapshotter/` | `/var/run/pv-snapshotter/` | gRPC socket |
-| `/run/containerd/containerd.sock` | `/run/containerd/containerd.sock` | containerd client |
+| `/run/containerd/` | `/run/containerd/` | containerd client (directory mount keeps the path valid across containerd restarts) |
 | `/var/lib/kubelet` | `/var/lib/kubelet` | make CSI mount paths visible |
 
 **Startup ordering:** containerd connects to the proxy plugin at startup and does **not** automatically reconnect if the plugin is unavailable. Ensure pv-snapshotter starts before containerd:
@@ -244,24 +244,41 @@ Required `hostPath` mounts:
 
 ## Helm Chart
 
-> 🚧 The Helm chart is under active development and will be released in an upcoming version.
+The Helm chart is available at `charts/pv-snapshotter/`.
 
-The chart will cover:
+```bash
+helm upgrade --install pv-snapshotter charts/pv-snapshotter \
+  --namespace pv-snapshotter-system --create-namespace \
+  --set image=your-registry/pv-snapshotter:vX.Y \
+  --set "containerdConfig.runtimeClasses={runc,nvidia}"
+```
 
-- DaemonSet with correct `hostPath` mounts and `tolerations`
-- RBAC for node-scoped operations
-- containerd config patch via `initContainer` (or `configMap` + node-config-operator)
-- RuntimeClass creation
-- `nodeSelector` / `affinity` for targeted rollout
-- Configurable annotation prefix and socket paths
+Key values:
 
-Track progress in the [Issues](../../issues) tab.
+| Value | Default | Description |
+|-------|---------|-------------|
+| `image` | — | pv-snapshotter image (required) |
+| `containerdConfig.runtimeClasses` | `[]` | Base runtime handler names to extend (e.g. `runc`, `nvidia`) |
+| `containerdConfig.suffix` | `-pv` | Suffix appended to each base name (`runc` → `runc-pv`) |
+| `unixSocketPath` | `/var/run/pv-snapshotter/daemon.sock` | gRPC socket path |
+| `annotationPrefix` | `pv-snapshotter.humble-mun.io` | Pod annotation prefix |
+| `tolerations` | control-plane NoSchedule | Node tolerations |
+
+The chart deploys:
+- A **ConfigMap** (`daemon.yaml`) that configures the daemon via viper (loaded from `/etc/humble-mun/daemon.yaml`).
+- A **DaemonSet** with two containers:
+  - `config` (native sidecar, `restartPolicy: Always`): waits for the daemon's `/readyz` endpoint, patches `/etc/containerd/config.toml` idempotently (copying the base runtime's config and adding `snapshotter = "pv-snapshotter"`), restarts containerd via a cgo nsenter preamble if needed, then blocks until Pod termination.
+  - `daemon`: the pv-snapshotter gRPC proxy snapshotter.
+- A **RuntimeClass** per entry in `containerdConfig.runtimeClasses`, named `<base><suffix>`.
+- A **ServiceAccount** with `automountServiceAccountToken: false` (no Kubernetes API access needed).
+
+All daemon flags can be overridden via `HM_`-prefixed environment variables or entries in `daemon.yaml`.
 
 ---
 
 ## CLI Flags
 
-All flags can also be set via environment variables (uppercase, `_`-separated, prefixed with `DAEMON_`).
+All flags can also be set via environment variables (uppercase, `_`-separated, prefixed with `HM_`).
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -384,7 +401,6 @@ After pv-snapshotter restarts, existing running containers still hold their over
 
 ### Future
 
-- [ ] Helm chart for DaemonSet deployment
 - [ ] Metrics endpoint (Prometheus) for mount latency and resolution errors
 - [ ] Support for Ceph RBD globalmount staging path (automatic path detection)
 - [ ] Multi-arch image builds (arm64)

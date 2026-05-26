@@ -1,7 +1,7 @@
 .DEFAULT_GOAL := build
 .PHONY: tag daemon build clean push
 
-BASE_IMAGE ?= gcr.io/distroless/static-debian12:latest
+BASE_IMAGE ?= gcr.io/distroless/base-debian13:latest
 NAME ?= pv-snapshotter
 ARCH ?= amd64
 VARIANT ?=

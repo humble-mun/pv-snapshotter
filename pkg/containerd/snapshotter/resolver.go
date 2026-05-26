@@ -274,18 +274,19 @@ func (r resolver) renderUpperdirTemplate(
 		varName := strings.TrimPrefix(k, r.keyVarPrefix)
 		data[varName] = v
 	}
-	r.logger.V(4).Info("template data assembled",
-		"key", key,
-		"builtins", map[string]string{"PodUID": data["PodUID"], "PodName": data["PodName"], "PodNamespace": data["PodNamespace"]},
-		"vars", func() map[string]string {
-			m := make(map[string]string)
-			for k, v := range data {
-				if k != "PodUID" && k != "PodName" && k != "PodNamespace" {
-					m[k] = v
-				}
+
+	if logger := r.logger.V(4); logger.Enabled() {
+		vars := make(map[string]string)
+		for k, v := range data {
+			if k != "PodUID" && k != "PodName" && k != "PodNamespace" {
+				vars[k] = v
 			}
-			return m
-		}())
+		}
+		logger.Info("template data assembled",
+			"key", key,
+			"builtins", map[string]string{"PodUID": data["PodUID"], "PodName": data["PodName"], "PodNamespace": data["PodNamespace"]},
+			"vars", vars)
+	}
 
 	tmpl, err := template.New("upperdir-path").Parse(tmplStr)
 	if err != nil {

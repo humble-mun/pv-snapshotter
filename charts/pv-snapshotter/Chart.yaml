@@ -1,0 +1,9 @@
+apiVersion: v2
+name: pv-snapshotter
+description: >
+  A containerd proxy snapshotter that redirects the overlay upperdir/workdir to a
+  caller-provided path (e.g. a mounted PersistentVolume), so that writes made
+  outside mounted volumes land on durable storage with zero copy overhead.
+type: application
+version: 0.1.0
+appVersion: 0.1.0

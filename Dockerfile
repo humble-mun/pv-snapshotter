@@ -1,5 +1,5 @@
 ARG GO_VERSION=1.26.3-trixie
-ARG BASE_IMAGE=gcr.io/distroless/static-debian12:latest
+ARG BASE_IMAGE=gcr.io/distroless/base-debian13:latest
 
 FROM golang:${GO_VERSION} AS builder
 
@@ -12,7 +12,11 @@ ARG VARIANT
 ARG GC_FLAGS
 ARG LD_FLAGS="-w -s"
 
-ENV CGO_ENABLED=0 GOOS=linux GOARCH=${ARCH}
+# CGO_ENABLED=1 is required for the cgo nsenter preamble (setns before Go
+# runtime starts).  The resulting binary links against glibc only (no libgcc
+# or libstdc++), so distroless/base (glibc + CA certs, no C++ runtime) is
+# sufficient as the runtime image.
+ENV CGO_ENABLED=1 GOOS=linux GOARCH=${ARCH}
 
 WORKDIR /go/src/${PROJECT}
 RUN --mount=type=bind,source=/,target=/go/src/${PROJECT} go build \

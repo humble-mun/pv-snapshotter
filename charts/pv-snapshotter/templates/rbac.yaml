@@ -1,0 +1,8 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+# automountServiceAccountToken is disabled: pv-snapshotter does not call the
+# Kubernetes API and does not need a token projected into the Pod.
+automountServiceAccountToken: false
