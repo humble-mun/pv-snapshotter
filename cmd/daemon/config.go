@@ -8,12 +8,11 @@ import (
 	"github.com/humble-mun/chassis/pkg/app"
 
 	pvconfig "github.com/humble-mun/pv-snapshotter/pkg/containerd/config"
-	"github.com/humble-mun/pv-snapshotter/pkg/service"
 )
 
 // configSubcommandName is the name used for viper config file lookup and the
 // HM_ env-var namespace for the "config" subcommand.
-const configSubcommandName = service.Name + "-config"
+const configSubcommandName = "config"
 
 // newConfigCommand returns the "config" subcommand.
 //
@@ -37,7 +36,7 @@ func newConfigCommand() *cobra.Command {
 	var initFn func() error
 
 	cmd := &cobra.Command{
-		Use:   "config",
+		Use:   configSubcommandName,
 		Short: "Wait for the daemon, patch the containerd config, and block until termination.",
 		Long: "Waits until the pv-snapshotter daemon's /readyz endpoint returns 200, then " +
 			"idempotently patches /etc/containerd/config.toml to register pv-snapshotter " +

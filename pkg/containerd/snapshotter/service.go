@@ -18,6 +18,9 @@ import (
 )
 
 const (
+	// Name is the service identifier used by the daemon.
+	Name = "daemon"
+
 	flagUnixSocketPath    = "unix-socket-path"
 	defaultUnixSocketPath = "/var/run/pv-snapshotter/daemon.sock"
 	flagContainerdSocket  = "containerd-socket"
