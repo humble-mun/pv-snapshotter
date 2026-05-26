@@ -3,6 +3,58 @@ kind: ServiceAccount
 metadata:
   name: {{ .Release.Name }}
   namespace: {{ .Release.Namespace }}
-# automountServiceAccountToken is disabled: pv-snapshotter does not call the
-# Kubernetes API and does not need a token projected into the Pod.
-automountServiceAccountToken: false
+# automountServiceAccountToken is managed at the Pod level (DaemonSet spec)
+# so that it can be toggled per the webhook.enabled flag.
+# The ServiceAccount-level default is left unset (cluster default applies).
+{{- if .Values.webhook.enabled }}
+---
+# ClusterRole grants the webhook handler the read access it needs to resolve
+# PVC/PV bindings and owner-reference chains.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Name }}
+rules:
+# PVCs and PVs: resolve which volume is bound to the pod's owner.
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  - persistentvolumes
+  verbs:
+  - get
+  - list
+# Workload controllers: traverse owner-reference chains.
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - replicasets
+  - statefulsets
+  - daemonsets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  - cronjobs
+  verbs:
+  - get
+  - list
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Name }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Name }}
+subjects:
+- kind: ServiceAccount
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+

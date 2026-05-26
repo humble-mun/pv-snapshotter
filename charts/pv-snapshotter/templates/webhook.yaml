@@ -1,0 +1,83 @@
+{{- if .Values.webhook.enabled }}
+{{- $webhookPort := last (splitList ":" .Values.webhook.bindAddress) | int }}
+---
+# Service: exposes the webhook HTTPS endpoint to the API server.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  selector:
+    app: {{ .Release.Name }}
+  ports:
+  - name: https
+    port: {{ $webhookPort }}
+    targetPort: https
+    protocol: TCP
+---
+# Certificate: issued by cert-manager for the webhook HTTPS server.
+# The secret name matches the volume mount in the DaemonSet.
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .Release.Name }}
+  namespace: {{ .Release.Namespace }}
+spec:
+  secretName: {{ .Release.Name }}
+  issuerRef:
+    name: {{ .Values.webhook.clusterIssuerName }}
+    kind: ClusterIssuer
+  dnsNames:
+  - {{ .Release.Name }}.{{ .Release.Namespace }}.svc
+  - {{ .Release.Name }}.{{ .Release.Namespace }}.svc.cluster.local
+---
+# MutatingWebhookConfiguration: intercepts Pod CREATE calls and routes them to
+# the /mutate endpoint.  The CA bundle is injected by cert-manager via the
+# cert-manager.io/inject-ca-from annotation.
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: {{ .Release.Name }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/{{ .Release.Name }}
+webhooks:
+- name: mutate.pv-snapshotter.humble-mun.io
+  admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: {{ .Release.Name }}
+      namespace: {{ .Release.Namespace }}
+      path: /mutate
+      port: {{ $webhookPort }}
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  namespaceSelector:
+    {{- if .Values.webhook.namespaceSelector }}
+    {{- toYaml .Values.webhook.namespaceSelector | nindent 4 }}
+    {{- else }}
+    {}
+    {{- end }}
+  objectSelector:
+    {{- if .Values.webhook.objectSelector }}
+    {{- toYaml .Values.webhook.objectSelector | nindent 4 }}
+    {{- else }}
+    {}
+    {{- end }}
+  rules:
+  - apiGroups:
+    - ""
+    apiVersions:
+    - v1
+    operations:
+    - CREATE
+    resources:
+    - pods
+    scope: Namespaced
+  sideEffects: None
+  timeoutSeconds: 10
+{{- end }}

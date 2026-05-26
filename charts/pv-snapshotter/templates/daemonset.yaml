@@ -5,14 +5,16 @@ metadata:
   namespace: {{ .Release.Namespace }}
 data:
   # viper reads /etc/humble-mun/daemon.yaml at startup (configName = "daemon").
-  # http-bind-address opens a plain TCP listener so that kubelet httpGet probes
-  # can reach /healthz and /readyz without needing Unix socket access.
-  # tls-cert-path / tls-key-path are explicitly cleared so that the plain
-  # listener does not attempt to load the default certificate paths.
   daemon.yaml: |+
+    {{- if .Values.webhook.enabled }}
+    http-bind-address: {{ .Values.webhook.bindAddress }}
+    tls-cert-path: {{ .Values.webhook.tlsCertPath }}
+    tls-key-path: {{ .Values.webhook.tlsKeyPath }}
+    {{- else }}
     http-bind-address: 0.0.0.0:8080
     tls-cert-path: ""
     tls-key-path: ""
+    {{- end }}
     unix-socket-path: {{ .Values.unixSocketPath }}
     containerd-socket: {{ .Values.containerdSocket }}
     annotation-prefix: {{ .Values.annotationPrefix }}
@@ -25,6 +27,26 @@ data:
       mount-options:
 {{ toYaml .Values.overlaySnapshotter.mountOptions | indent 6 }}
       {{- end }}
+    {{- if .Values.webhook.enabled }}
+    webhook-enabled: true
+    webhook-pvc-name-template: {{ .Values.webhook.pvcNameTemplate | quote }}
+    webhook-pvc-selector-template: {{ .Values.webhook.pvcSelectorTemplate | quote }}
+    webhook-max-owner-depth: {{ .Values.webhook.maxOwnerDepth }}
+    webhook-default-runtime-class: {{ .Values.webhook.defaultRuntimeClass | quote }}
+    webhook-runtime-class-suffix: {{ .Values.webhook.runtimeClassSuffix | quote }}
+    webhook-bound-timeout: {{ .Values.webhook.boundTimeout }}
+    webhook-state-mount-path: {{ .Values.webhook.stateMountPath | quote }}
+    {{- /* webhook-annotation-templates is intentionally omitted from this
+         ConfigMap. viper's insensitiviseMap lowercases all map keys when
+         reading YAML, corrupting annotation key casing (e.g. "PVName" →
+         "pvname"). The webhook reads annotation templates exclusively from
+         the compiled-in pflag default (pkg/webhook/mutating.go), which
+         bypasses YAML parsing and preserves the original casing.
+         To override, pass --webhook-annotation-templates on the command line
+         (not via this ConfigMap). */ -}}
+    {{- else }}
+    webhook-enabled: false
+    {{- end }}
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -47,10 +69,11 @@ spec:
         app: {{ .Release.Name }}
     spec:
       serviceAccountName: {{ .Release.Name }}
-      # pv-snapshotter does not call the Kubernetes API; disable the service
-      # account token projection to reduce the Pod's attack surface.
-      automountServiceAccountToken: false
-      # hostPID exposes /proc/1/ns/mnt to the init container so that the Go
+      # automountServiceAccountToken is enabled when the webhook is active
+      # (the webhook handler queries the Kubernetes API using in-cluster auth).
+      # It is disabled otherwise to reduce the Pod's attack surface.
+      automountServiceAccountToken: {{ .Values.webhook.enabled }}
+      # hostPID exposes /proc/1/ns/mnt to the config sidecar so that the Go
       # setns(2) call can enter the host mount namespace and exec systemctl.
       hostPID: true
       {{- with .Values.priorityClassName }}
@@ -75,18 +98,11 @@ spec:
       #
       # Lifecycle:
       #   1. Wait until the pv-snapshotter daemon's /readyz returns 200
-      #      (HTTP over Unix socket).  The daemon must be up first: containerd
-      #      connects to the daemon socket at restart time, so restarting
-      #      containerd before the daemon is ready would be pointless.
+      #      (HTTP over Unix socket).
       #   2. Patch /etc/containerd/config.toml (idempotent, sparse append).
       #   3. If modified: enter host mount namespace via setns(2) + exec
-      #      "systemctl restart containerd".  The process is replaced by
-      #      systemctl; Kubernetes restarts the sidecar, which re-enters at
-      #      step 1 (already-configured path, skips restart).
+      #      "systemctl restart containerd".
       #   4. Block on SIGTERM — keeps the sidecar alive for the Pod lifetime.
-      #
-      # Running as a native sidecar guarantees this container starts before the
-      # main container and is restarted independently if it crashes.
       # -----------------------------------------------------------------------
       - name: config
         image: {{ .Values.image }}
@@ -113,19 +129,36 @@ spec:
         volumeMounts:
         - name: host-etc-containerd
           mountPath: /host/etc/containerd
-        # pv-snapshotter gRPC socket directory: needed to probe /readyz via Unix socket.
         - name: socket-dir
           mountPath: /var/run/pv-snapshotter
 
       containers:
       # -----------------------------------------------------------------------
-      # Main container: the pv-snapshotter gRPC daemon.
+      # Main container: the pv-snapshotter gRPC daemon (and webhook, if enabled).
       # All configuration is sourced from /etc/humble-mun/daemon.yaml (viper).
       # -----------------------------------------------------------------------
       - name: daemon
         image: {{ .Values.image }}
         command:
         - daemon
+        {{- if and .Values.webhook.enabled .Values.webhook.annotationTemplates }}
+        args:
+        # --webhook-annotation-templates is passed as a command-line argument
+        # rather than written to daemon.yaml.  viper's YAML parser runs
+        # insensitiviseMap on every map value it reads, which lowercases all
+        # map keys — corrupting annotation key casing (e.g. "var.PVName" →
+        # "var.pvname").  Passing the flag on the command line routes it through
+        # pflag's stringToString parser, which preserves casing exactly.
+        # Format: key=value pairs joined by commas (CSV; quote pairs that
+        # contain commas using standard CSV double-quote rules).
+        - >-
+          --webhook-annotation-templates=
+          {{- $pairs := list -}}
+          {{- range $k, $v := .Values.webhook.annotationTemplates -}}
+            {{- $pairs = append $pairs (printf "%s=%s" $k $v) -}}
+          {{- end -}}
+          {{- $pairs | join "," }}
+        {{- end }}
         env:
         - name: HM_NODE_NAME
           valueFrom:
@@ -134,6 +167,12 @@ spec:
         securityContext:
           privileged: true
           runAsUser: 0
+        {{- if .Values.webhook.enabled }}
+        ports:
+        - name: https
+          containerPort: {{ last (splitList ":" .Values.webhook.bindAddress) }}
+          protocol: TCP
+        {{- end }}
         volumeMounts:
         # viper config file mounted as a single file via subPath.
         - name: config
@@ -143,10 +182,8 @@ spec:
         # gRPC socket; containerd connects to this host path.
         - name: socket-dir
           mountPath: /var/run/pv-snapshotter
-        # containerd client socket used to resolve pod annotations at Mounts() time.
-        # Mount the parent directory (not the socket file itself) so that the
-        # path remains valid across containerd restarts: the daemon deletes and
-        # recreates the socket file, which would break a file-level bind-mount.
+        # containerd client socket directory — mount the directory (not the
+        # socket file) so that the path remains valid across containerd restarts.
         - name: containerd-run
           mountPath: /run/containerd
         # Kubelet volume tree must be visible so CSI mount paths resolve correctly.
@@ -157,6 +194,12 @@ spec:
         - name: containerd-root
           mountPath: {{ .Values.overlaySnapshotter.rootPath }}
           mountPropagation: HostToContainer
+        {{- if .Values.webhook.enabled }}
+        # TLS certificate issued by cert-manager for the webhook HTTPS server.
+        - name: tls
+          mountPath: /etc/pv-snapshotter/pki
+          readOnly: true
+        {{- end }}
         resources:
           requests:
             cpu: 50m
@@ -164,20 +207,38 @@ spec:
         startupProbe:
           httpGet:
             path: /healthz
+            {{- if .Values.webhook.enabled }}
+            port: {{ last (splitList ":" .Values.webhook.bindAddress) }}
+            scheme: HTTPS
+            {{- else }}
             port: 8080
+            scheme: HTTP
+            {{- end }}
           periodSeconds: 2
           failureThreshold: 30
         livenessProbe:
           httpGet:
             path: /healthz
+            {{- if .Values.webhook.enabled }}
+            port: {{ last (splitList ":" .Values.webhook.bindAddress) }}
+            scheme: HTTPS
+            {{- else }}
             port: 8080
+            scheme: HTTP
+            {{- end }}
           periodSeconds: 15
           timeoutSeconds: 3
           failureThreshold: 3
         readinessProbe:
           httpGet:
             path: /readyz
+            {{- if .Values.webhook.enabled }}
+            port: {{ last (splitList ":" .Values.webhook.bindAddress) }}
+            scheme: HTTPS
+            {{- else }}
             port: 8080
+            scheme: HTTP
+            {{- end }}
           periodSeconds: 5
           timeoutSeconds: 3
           failureThreshold: 2
@@ -187,7 +248,7 @@ spec:
       - name: config
         configMap:
           name: {{ .Release.Name }}
-      # Host /etc/containerd — mounted into the configure-containerd init container.
+      # Host /etc/containerd — mounted into the config sidecar.
       - name: host-etc-containerd
         hostPath:
           path: /etc/containerd
@@ -213,4 +274,10 @@ spec:
         hostPath:
           path: {{ .Values.overlaySnapshotter.rootPath }}
           type: DirectoryOrCreate
+      {{- if .Values.webhook.enabled }}
+      # TLS certificate issued by cert-manager.
+      - name: tls
+        secret:
+          secretName: {{ .Release.Name }}
+      {{- end }}
 

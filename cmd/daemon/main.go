@@ -12,6 +12,7 @@ import (
 	"github.com/humble-mun/chassis/pkg/server"
 
 	"github.com/humble-mun/pv-snapshotter/pkg/containerd/snapshotter"
+	"github.com/humble-mun/pv-snapshotter/pkg/webhook"
 )
 
 func newRootCommand() *cobra.Command {
@@ -55,6 +56,14 @@ func newRootCommand() *cobra.Command {
 				}
 			}()
 
+			if webhook.Enabled() {
+				var h *webhook.Handler
+				if h, err = webhook.New(rootLogger); err != nil {
+					return
+				}
+				httpGin.RegisterRoute(h.RegisterRoute)
+			}
+
 			logger.Info("snapshotter started")
 			defer logger.Info("snapshotter finished")
 			if err = httpGin.Start(ctx); err != nil {
@@ -66,7 +75,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
-	init = app.PrepareFlags(snapshotter.Name, cmd, snapshotter.RegisterFlags)
+	init = app.PrepareFlags(snapshotter.Name, cmd, snapshotter.RegisterFlags, webhook.RegisterFlags)
 	cmd.AddCommand(newConfigCommand())
 	return cmd
 }

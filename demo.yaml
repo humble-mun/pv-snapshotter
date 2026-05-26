@@ -1,0 +1,124 @@
+# demo.yaml — end-to-end verification of the webhook + pv-snapshotter pipeline.
+#
+# What this exercises:
+#   1. Webhook objectSelector  — pod carries the opt-in label
+#                                (pv-snapshotter.humble-mun.io/inject: "true").
+#   2. Owner resolution        — pod → ReplicaSet → Deployment (depth 2);
+#                                OwnerName resolves to the Deployment name "demo".
+#   3. PVC lookup              — pvcNameTemplate "{{.OwnerName}}" → PVC "demo".
+#   4. Bound wait              — webhook waits up to 10 s for the PVC to bind.
+#   5. RuntimeClass rewrite    — pod has no runtimeClassName; webhook sets
+#                                "runc-pv" (defaultRuntimeClass "runc" + suffix "-pv").
+#   6. Volume/mount injection  — webhook appends volume "pv-snapshotter--state"
+#                                backed by PVC "demo" and mounts it at
+#                                /.platform/state inside the container.
+#   7. Annotation injection    — webhook stamps upperdir-path-template and
+#                                var.PVName onto the pod.
+#   8. pv-snapshotter routing  — containerd calls Mounts() for the pod's snapshot;
+#                                pv-snapshotter reads the annotations, renders
+#                                {{.PodUID}} → actual UID, and rewrites
+#                                  upperdir=…/mount/upper
+#                                  workdir=…/mount/work
+#                                so the container's entire writable layer lives on
+#                                the PVC (not under /var/lib/containerd).
+#   9. Persistence check       — write a file anywhere in the container's
+#                                filesystem (e.g. /tmp/sentinel.txt); because the
+#                                overlay upperdir is on the PVC, all writes outside
+#                                explicitly mounted volumes are durable across pod
+#                                restarts.
+#
+# Prerequisites:
+#   - pv-snapshotter DaemonSet running; proxy plugin registered in containerd.
+#   - RuntimeClass "runc-pv" present (created by the Helm chart).
+#   - cert-manager + MutatingWebhookConfiguration installed (Helm chart).
+#   - A default StorageClass present in the cluster (PVC omits storageClassName).
+#
+# Apply:
+#   kubectl apply -f demo.yaml
+#
+# Verify:
+#   # 1. PVC bound
+#   kubectl get pvc demo
+#
+#   # 2. Pod running and webhook-injected fields visible
+#   POD=$(kubectl get pod -l app=demo -o name | head -1)
+#   kubectl get $POD -o yaml | grep -E 'runtimeClassName|pv-snapshotter|pv-snapshotter--state'
+#
+#   # 3. Confirm upperdir is on the PVC mount, not under /var/lib/containerd
+#   #   (run on the node that hosts the pod)
+#   #   NODE_POD_UID=$(kubectl get $POD -o jsonpath='{.metadata.uid}')
+#   #   findmnt -t overlay | grep $NODE_POD_UID
+#   #   # upperdir= should point to /var/lib/kubelet/pods/<uid>/volumes/…/upper
+#
+#   # 4. Write a sentinel file to the container's root filesystem
+#   #   (the overlay upperdir is on the PVC, so this write is durable)
+#   kubectl exec $POD -c demo -- sh -c 'echo ok > /tmp/sentinel.txt'
+#
+#   # 5. Delete the pod — the ReplicaSet recreates it against the same PVC
+#   kubectl delete $POD
+#   kubectl wait --for=condition=Ready pod -l app=demo --timeout=60s
+#
+#   # 6. Confirm the file survived pod recreation
+#   kubectl exec $(kubectl get pod -l app=demo -o name | head -1) -c demo -- \
+#     cat /tmp/sentinel.txt
+#   # expected output: ok
+#
+# Teardown:
+#   kubectl delete -f demo.yaml
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  # Must match the Deployment name below.
+  # The webhook resolves OwnerName = Deployment.name and looks up the PVC by
+  # that name (default pvcNameTemplate: "{{.OwnerName}}").
+  name: demo
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+  # storageClassName is intentionally omitted — the cluster default StorageClass
+  # is used.  Replace with an explicit class if needed, e.g.:
+  #   storageClassName: openebs-zfspv
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo
+  template:
+    metadata:
+      labels:
+        app: demo
+        # Opt-in label required by the MutatingWebhookConfiguration objectSelector.
+        # Without this label the webhook does not mutate the pod.
+        pv-snapshotter.humble-mun.io/inject: "true"
+    spec:
+      # runtimeClassName is intentionally absent.
+      # The webhook sets it to "runc-pv" (defaultRuntimeClass "runc" + suffix "-pv").
+      containers:
+      - name: demo
+        image: busybox:latest
+        command:
+        - sh
+        - -c
+        - |
+          echo "=== pv-snapshotter demo ==="
+          echo "/.platform/state (injected state mount):"
+          ls -la /.platform/state
+          echo "ready — sleeping"
+          exec sleep infinity
+        # /.platform/state is injected by the webhook (volume "pv-snapshotter--state"
+        # backed by PVC "demo").  The container itself declares no volumeMounts here;
+        # they are added by the webhook at admission time.
+        #
+        # Do NOT also mount PVC "demo" at another path inside the container.
+        # The PVC root is the raw overlay upperdir; upper/ and work/ subdirectories
+        # are created there by pv-snapshotter.  Direct writes by the workload into
+        # the backing path can corrupt the overlay metadata.

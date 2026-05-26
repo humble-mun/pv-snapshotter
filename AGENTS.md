@@ -220,7 +220,7 @@ If the upperdir path is not a mountpoint (volume not yet ready), `Mounts()` retu
 pv-snapshotter/
 ├── cmd/
 │   └── daemon/                  # main entrypoint
-│       ├── main.go              # root command (daemon gRPC server)
+│       ├── main.go              # root command (daemon gRPC server + webhook)
 │       └── config.go            # "config" subcommand (sidecar lifecycle)
 ├── pkg/
 │   ├── containerd/
@@ -234,16 +234,18 @@ pv-snapshotter/
 │   │       ├── overlay.go       # native overlay snapshotter construction and config struct
 │   │       ├── mount.go         # ensureUpperdirReady, replaceUpperdirOptions
 │   │       └── resolver.go      # annotation lookup via containerd client at Mounts() time
-│   └── service/
-│       └── common.go            # service name constant
+│   └── webhook/
+│       └── mutating.go          # mutating admission webhook: owner resolution, PVC/PV lookup, pod patching
 ├── charts/
 │   └── pv-snapshotter/          # Helm chart
 │       ├── Chart.yaml
 │       ├── values.yaml
 │       └── templates/
 │           ├── daemonset.yaml   # ConfigMap + DaemonSet (daemon + config sidecar)
-│           ├── rbac.yaml        # ServiceAccount (automountServiceAccountToken: false)
-│           └── runtimeclass.yaml
+│           ├── rbac.yaml        # ServiceAccount; ClusterRole+Binding when webhook.enabled=true
+│           ├── runtimeclass.yaml
+│           └── webhook.yaml     # Service + Certificate + MutatingWebhookConfiguration (webhook.enabled=true only)
+├── demo.yaml                    # end-to-end validation manifest (Deployment + PVC)
 ├── Dockerfile                   # CGO_ENABLED=1, distroless/base-debian13
 ├── Makefile
 ├── go.mod
@@ -272,7 +274,7 @@ type snapshotter struct {
 
 No `pvBacked` field. There is no separate branch snapshotter. The redirected path is purely a mount options rewrite in `Mounts()`.
 
-### CLI flags (service.go + resolver.go)
+### CLI flags (service.go + resolver.go + mutating.go)
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -284,6 +286,18 @@ No `pvBacked` field. There is no separate branch snapshotter. The redirected pat
 | `--overlay-snapshotter.sync-remove` | `false` | Synchronous snapshot removal |
 | `--overlay-snapshotter.slow-chown` | `false` | Slow chown for ID-mapped mounts |
 | `--overlay-snapshotter.mount-options` | `[]` | Extra mount options passed to overlayfs; **never add `volatile`** |
+| `--webhook-enabled` | `true` | Enable the mutating admission webhook endpoint |
+| `--webhook-pvc-name-template` | `{{.OwnerName}}` | Go template → PVC name to bind to the pod |
+| `--webhook-pvc-selector-template` | `""` | Go template → label selector; fallback when name template yields empty |
+| `--webhook-max-owner-depth` | `2` | Owner-reference traversal depth (0 = use pod name directly) |
+| `--webhook-default-runtime-class` | `runc` | Base RuntimeClass when pod has no runtimeClassName |
+| `--webhook-runtime-class-suffix` | `-pv` | Suffix appended to the base RuntimeClass name |
+| `--webhook-bound-timeout` | `10s` | Max wait for PVC to reach Bound phase before denying the pod |
+| `--webhook-state-mount-path` | `/.platform/state` | Container mount path for the injected state volume |
+| `--webhook-annotation-templates` | *(see below)* | pflag `stringToString` CSV map of annotation key→Go-template-value |
+
+**`--webhook-annotation-templates` delivery constraint:**
+This flag must be delivered as a CLI argument, never written to `daemon.yaml`. viper's YAML parser runs `insensitiviseMap` (which lowercases all map keys recursively) on every YAML value it reads, corrupting annotation key casing (e.g. `var.PVName` → `var.pvname`). The CLI argument path routes through pflag's `stringToString` CSV parser, which preserves casing exactly.
 
 ### resolver struct (resolver.go)
 
@@ -374,6 +388,8 @@ v1.x has no `/v2` suffix and uses `snapshots/overlay` instead of `plugins/snapsh
 - **Do not** filter containerd containers by `snapshot_key` — `adaptContainer` silently ignores it; filter by `id` instead.
 - **Do not** silently fall back to native overlay on `ensureUpperdirReady` failure — fail hard; silent fallback causes undetected state loss.
 - **Do not** add a `pvBacked snapshots.Snapshotter` field to the snapshotter struct — the redirected path is purely a mount options rewrite, not a separate snapshotter branch.
+- **Do not** write `webhook-annotation-templates` to `daemon.yaml` (the viper config file) — viper's `insensitiviseMap` lowercases all map keys during YAML parsing, corrupting annotation key casing. This flag must always be passed as a CLI argument.
+- **Do not** use the `{{ "{{" }}` Go template escape syntax in `webhook-annotation-templates` flag values — pflag's `stringToString` uses a CSV parser, and bare double-quotes in a CSV field cause a parse error. Instead, pre-populate `templateData.PodUID` with the literal string `"{{.PodUID}}"` so it passes through Layer 2 unchanged.
 
 ---
 
@@ -419,17 +435,7 @@ upperdir redirection fully implemented and verified:
 - End-to-end verified with ZFS LocalPV: the container's overlay mount confirms `upperdir` points to the provided path
 - State persistence verified: write a file → delete the pod → recreate a pod referencing the same backing path → file is preserved
 
-### Annotation design: template support added
-
-Beyond the original literal `upperdir-path`, a `upperdir-path-template` key was added to support dynamic path construction. The `--annotation-prefix` flag makes the annotation namespace configurable.
-
-The caller writes the resolved path into the annotation. For ZFS LocalPV (no globalmount staging path), the path is:
-
-```
-/var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount
-```
-
-### Done — Phase 3: Helm chart + containerd config automation (CURRENT STATE)
+### Done — Phase 3: Helm chart + containerd config automation
 
 Full DaemonSet deployment package implemented:
 
@@ -445,9 +451,48 @@ Full DaemonSet deployment package implemented:
   4. `<-ctx.Done()`: block for Pod lifetime as native sidecar
 - **`charts/pv-snapshotter/`** — complete Helm chart; see Deployment section for details
 
+### Done — Phase 4: Mutating admission webhook (CURRENT STATE — production ready)
+
+Out-of-the-box experience: workload Pods that carry the opt-in label are automatically injected with the state volume, annotations, and pv-backed RuntimeClass — no manual annotation authoring required.
+
+- **`pkg/webhook/mutating.go`** — mutating webhook handler:
+  - `Handler`: resolves controlling owner (owner-reference traversal up to `maxOwnerDepth`), looks up the associated PVC, waits up to `boundTimeout` for it to reach Bound, fetches the backing PV, builds a JSON Patch, and returns it to the API server
+  - Owner traversal: follows `Controller=true` owner refs through ReplicaSet → Deployment (and any other well-known workload kinds) using the dynamic client (`Unstructured` GET); warns and takes first when multiple controller refs exist at the same level
+  - PVC resolution: name-template path (default `{{.OwnerName}}`) takes precedence; falls back to label-selector template
+  - Bound wait: polls every 2 s up to `boundTimeout` (default 10 s); fails hard on timeout — admitting the pod before the volume is bound only defers the failure to the node
+  - Patch operations: (1) annotations, (2) state volume `pv-snapshotter--state` backed by the PVC, (3) state `volumeMount` at `/.platform/state` injected into every container and init container, (4) `runtimeClassName` rewritten to `<base>-pv` (using `defaultRuntimeClass` when pod has none)
+  - `sha256` template function available in all templates (useful for Ceph RBD `volumeHandle` paths)
+- **`charts/pv-snapshotter/templates/webhook.yaml`** — webhook-specific resources (rendered only when `webhook.enabled=true`):
+  - `Service` (ClusterIP, port 9443)
+  - `Certificate` (cert-manager, DNS SANs for the in-cluster service FQDN)
+  - `MutatingWebhookConfiguration` with `cert-manager.io/inject-ca-from` annotation; `objectSelector` defaults to `matchLabels: pv-snapshotter.humble-mun.io/inject: "true"` (opt-in, not cluster-wide)
+- **`charts/pv-snapshotter/templates/rbac.yaml`** — `ClusterRole` + `ClusterRoleBinding` rendered only when `webhook.enabled=true`; grants: PVC/PV get+list, Deployment/ReplicaSet/StatefulSet/DaemonSet/Job/CronJob get+list
+- **`demo.yaml`** — end-to-end validation manifest (Deployment + PVC, no storageClassName)
+
+#### Annotation template rendering pipeline (three layers)
+
+The `webhook-annotation-templates` flag drives a three-layer rendering pipeline:
+
+| Layer | Renderer | Variables resolved | Output |
+|-------|----------|--------------------|--------|
+| 1 | Helm | `values.yaml` → CLI arg | `--webhook-annotation-templates=k=v,...` (pflag CSV) |
+| 2 | Webhook (`text/template`) | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName` | annotation value patched onto pod |
+| 3 | pv-snapshotter (`text/template`) | `.PodUID`, `.PodName`, `.PodNamespace`, `var.*` | final `upperdir` path |
+
+Layer-3 pass-through: `templateData.PodUID` is pre-populated with the string `"{{.PodUID}}"` so that `{{.PodUID}}` in a Layer-2 template renders as the literal `{{.PodUID}}` — which pv-snapshotter re-renders at `Mounts()` time.
+
+**Critical constraint — `webhook-annotation-templates` must NOT appear in `daemon.yaml`:**
+viper's YAML parsing path calls `insensitiviseMap`, which recursively lowercases all map keys. This corrupts annotation key casing (`var.PVName` → `var.pvname`). The flag is delivered exclusively as a CLI argument (rendered by Helm from `values.yaml`), which routes through pflag's `stringToString` CSV parser and preserves casing.
+
+The `webhook-annotation-templates` value in `values.yaml` is therefore illustrative — it shows the default template text and explains the three-layer pipeline. The Helm chart renders it into a `--webhook-annotation-templates=...` CLI argument on the daemon container; it is never written to the ConfigMap / `daemon.yaml`.
+
+**Note on `var.PVName`:** The default `upperdir-path-template` renders `{{.PVName}}` (a Layer-2 variable) at webhook time, substituting the actual PV name into the path. The companion `var.PVName` annotation is also stamped onto the pod with the rendered PV name, making the value available to pv-snapshotter's own template engine for any custom template that references `{{.PVName}}` at Layer 3. The Layer-2 substitution of `{{.PVName}}` in `upperdir-path-template` itself is intentional and correct — pv-snapshotter does not need to re-resolve the PV name since the webhook has already embedded it literally in the path.
+
 ---
 
 ## Next Steps
+
+pv-snapshotter is **production ready**. The items below are optional hardening and future enhancements; the core functionality is complete and verified.
 
 ### Production hardening
 

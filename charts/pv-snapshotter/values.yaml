@@ -30,7 +30,7 @@ overlaySnapshotter:
   mountOptions: []
 
 # ---------------------------------------------------------------------------
-# containerd config patching (init container: "config apply")
+# containerd config patching (sidecar container: "config")
 # ---------------------------------------------------------------------------
 containerdConfig:
   # path is the host-side path to config.toml, accessed via the hostPath volume.
@@ -50,6 +50,103 @@ containerdConfig:
 
   # suffix is appended to each base name to form the pv-backed handler name.
   suffix: -pv
+
+# ---------------------------------------------------------------------------
+# Mutating admission webhook
+# ---------------------------------------------------------------------------
+webhook:
+  # enabled controls whether the webhook endpoint is started and all
+  # associated Kubernetes resources (Certificate, Service,
+  # MutatingWebhookConfiguration, RBAC) are rendered by the chart.
+  # When false, automountServiceAccountToken reverts to false (no K8s API
+  # access needed) and no TLS cert is required.
+  enabled: true
+
+  # clusterIssuerName is the cert-manager ClusterIssuer used to issue the
+  # webhook TLS certificate.
+  clusterIssuerName: selfsigned
+
+  # bindAddress is the host:port the webhook HTTPS server listens on.
+  bindAddress: "0.0.0.0:9443"
+
+  # tlsCertPath / tlsKeyPath are the paths inside the container where the
+  # cert-manager-issued TLS certificate and key are mounted.
+  tlsCertPath: /etc/pv-snapshotter/pki/tls.crt
+  tlsKeyPath:  /etc/pv-snapshotter/pki/tls.key
+
+  # pvcNameTemplate is a Go template rendered to the PVC name to bind to the
+  # pod. Template variables: .OwnerName, .PodName.
+  pvcNameTemplate: "{{.OwnerName}}"
+
+  # pvcSelectorTemplate is a Go template rendered to a label selector string
+  # used to list PVCs. Used only when pvcNameTemplate produces an empty value.
+  pvcSelectorTemplate: ""
+
+  # maxOwnerDepth controls how many owner-reference hops to traverse when
+  # resolving the controlling owner name. 0 = use pod name directly.
+  maxOwnerDepth: 2
+
+  # defaultRuntimeClass is the base RuntimeClass name used when the pod does
+  # not specify runtimeClassName. The pv-backed name is
+  # "<defaultRuntimeClass><runtimeClassSuffix>".
+  # When empty and the pod has no runtimeClassName, runtimeClassName is not patched.
+  defaultRuntimeClass: "runc"
+
+  # runtimeClassSuffix is appended to the pod's runtimeClassName (or
+  # defaultRuntimeClass when the pod has none) to select the pv-backed
+  # RuntimeClass (e.g. "runc" + "-pv" → "runc-pv").
+  runtimeClassSuffix: "-pv"
+
+  # boundTimeout is how long the webhook waits for the PVC to reach the Bound
+  # phase before denying the pod. pv-snapshotter cannot prepare the overlay
+  # upperdir on an unbound volume; admitting the pod early only defers the
+  # failure to the node.
+  boundTimeout: 10s
+
+  # stateMountPath is the container path at which the injected state volume
+  # is mounted.
+  stateMountPath: "/.platform/state"
+
+  # annotationTemplates is a map of annotation key → Go template value stamped
+  # onto mutated pods.
+  #
+  # THREE-LAYER RENDERING PIPELINE:
+  #
+  #   Layer 1 — Helm renders daemonset.yaml. Values from this map are passed
+  #              as a --webhook-annotation-templates command-line argument in
+  #              pflag stringToString (CSV) format: key=value,key=value.
+  #              NOTE: do NOT use {{ "{{" }} escape syntax — pflag uses a CSV
+  #              parser, and bare double-quotes in a CSV field cause a parse
+  #              error. Use plain {{.VarName}} for all template variables.
+  #
+  #   Layer 2 — The webhook parses each value as a Go text/template and
+  #              executes it. Variables resolved here: .PVName, .VolumeHandle,
+  #              .OwnerName, .PodName. Pass-through variables (.PodUID,
+  #              .PodNamespace) are pre-populated with their own action text
+  #              so {{.PodUID}} renders as the literal string "{{.PodUID}}".
+  #
+  #   Layer 3 — pv-snapshotter re-renders the annotation value at Mounts()
+  #              time. Variables resolved here: .PodUID, .PodName,
+  #              .PodNamespace (+ any var.* annotations from the pod).
+  #
+  # The default is suitable for ZFS LocalPV and any CSI driver that mounts
+  # directly under the kubelet pod volume tree (no globalmount staging).
+  annotationTemplates:
+    pv-snapshotter.humble-mun.io/upperdir-path-template: '/var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount'
+    pv-snapshotter.humble-mun.io/var.PVName: '{{.PVName}}'
+
+  # namespaceSelector restricts which namespaces the webhook intercepts.
+  # An empty selector matches all namespaces.
+  namespaceSelector: {}
+
+  # objectSelector filters which pods the webhook intercepts.
+  # Only pods whose labels match this selector are mutated; all others are
+  # admitted without modification. The default opt-in label keeps the webhook
+  # from touching every pod in the cluster — workloads must explicitly declare
+  # the label to receive state-volume injection.
+  objectSelector:
+    matchLabels:
+      pv-snapshotter.humble-mun.io/inject: "true"
 
 # ---------------------------------------------------------------------------
 # DaemonSet scheduling

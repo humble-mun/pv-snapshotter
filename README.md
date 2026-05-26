@@ -4,6 +4,8 @@
 
 A containerd proxy snapshotter that redirects an overlayfs container's writable layer (`upperdir`/`workdir`) to a caller-provided path — for example, a mounted PersistentVolume — so that writes made outside mounted volumes can land on durable storage with zero data-copy overhead.
 
+**Production ready.** Core snapshotter, Helm chart, containerd config automation, and mutating admission webhook are all implemented and verified end-to-end.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -15,9 +17,14 @@ A containerd proxy snapshotter that redirects an overlayfs container's writable 
   - [containerd Configuration](#containerd-configuration)
   - [RuntimeClass](#runtimeclass)
   - [Pod Annotation Reference](#pod-annotation-reference)
+- [Mutating Admission Webhook](#mutating-admission-webhook)
+  - [What the Webhook Does](#what-the-webhook-does)
+  - [Annotation Template Pipeline](#annotation-template-pipeline)
+  - [Webhook Prerequisites](#webhook-prerequisites)
 - [DaemonSet Deployment](#daemonset-deployment)
 - [Helm Chart](#helm-chart)
 - [CLI Flags](#cli-flags)
+- [End-to-End Validation](#end-to-end-validation)
 - [Observability](#observability)
 - [Operational Notes](#operational-notes)
 - [Roadmap](#roadmap)
@@ -203,7 +210,9 @@ spec:
 
 ### Pod Annotation Reference
 
-The annotations below must be computed and written onto the pod by the caller (an operator, controller, or admission webhook that you provide) before the pod is created. The snapshotter only consumes them.
+The annotations below must be computed and written onto the pod by the caller (an operator, controller, or admission webhook) before the pod is created. The snapshotter only consumes them.
+
+> **If you use the Helm chart with `webhook.enabled=true`** (the default), the webhook computes and injects these annotations automatically — you do not write them yourself. See [Mutating Admission Webhook](#mutating-admission-webhook).
 
 ```yaml
 metadata:
@@ -218,6 +227,56 @@ metadata:
 ```
 
 Pods without either annotation pass through transparently to native overlayfs.
+
+---
+
+## Mutating Admission Webhook
+
+The webhook is enabled by default (`webhook.enabled=true` in `values.yaml`). It provides an out-of-the-box experience: workloads that carry an opt-in label are automatically injected with the state volume, annotations, and pv-backed RuntimeClass — no manual annotation authoring required.
+
+### What the Webhook Does
+
+When a Pod is admitted and its labels match the configured `objectSelector` (default: `pv-snapshotter.humble-mun.io/inject: "true"`), the webhook:
+
+1. **Resolves the controlling owner** by traversing owner references up to `maxOwnerDepth` hops (default 2: pod → ReplicaSet → Deployment). The resolved name becomes `OwnerName`.
+2. **Looks up the associated PVC** using `pvcNameTemplate` (default `{{.OwnerName}}`), then waits up to `boundTimeout` (default 10 s) for it to reach Bound. Denies the pod if the PVC does not bind in time — pv-snapshotter cannot prepare the overlay upperdir on an unbound volume, so admitting early only defers the failure to the node.
+3. **Fetches the backing PV** and extracts `spec.csi.volumeHandle` (empty for non-CSI PVs).
+4. **Builds a JSON Patch** that:
+   - Stamps `upperdir-path-template` and `var.PVName` annotations onto the pod.
+   - Appends volume `pv-snapshotter--state` (backed by the PVC) to `spec.volumes`.
+   - Appends a `volumeMount` at `/.platform/state` to every container and init container.
+   - Rewrites `runtimeClassName` to `<base>-pv` (e.g. `runc-pv`), using `defaultRuntimeClass` when the pod has none.
+
+The volume name `pv-snapshotter--state` uses the double-dash vendor separator to avoid colliding with user-defined volume names.
+
+### Annotation Template Pipeline
+
+Annotations are rendered through a three-layer pipeline:
+
+| Layer | Renderer | Variables | Purpose |
+|-------|----------|-----------|---------|
+| 1 | Helm | `values.yaml` | Renders `--webhook-annotation-templates` CLI arg |
+| 2 | Webhook | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName` | Resolves storage-side values; stamps annotation onto pod |
+| 3 | pv-snapshotter | `.PodUID`, `.PodName`, `.PodNamespace`, `var.*` | Resolves pod-identity values at `Mounts()` time |
+
+The default `upperdir-path-template` value:
+
+```
+/var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount
+```
+
+- `{{.PVName}}` is resolved by the webhook (Layer 2) and substituted with the actual PV name.
+- `{{.PodUID}}` passes through Layer 2 unchanged and is resolved by pv-snapshotter (Layer 3).
+
+The `var.PVName` annotation is also stamped with the resolved PV name, making it available to any custom Layer-3 template that references `{{.PVName}}`.
+
+> **Note on `webhook-annotation-templates` configuration:** The `annotationTemplates` field in `values.yaml` is illustrative — it documents the default template text and the three-layer pipeline. The Helm chart renders these values as a `--webhook-annotation-templates=...` CLI argument on the daemon container rather than writing them to `daemon.yaml`. This is intentional: viper's YAML parser lowercases all map keys (`var.PVName` → `var.pvname`), which corrupts annotation key casing. Passing the flag on the command line routes it through pflag's CSV parser, which preserves casing exactly.
+
+### Webhook Prerequisites
+
+- **cert-manager** must be installed in the cluster to issue the webhook TLS certificate.
+- A `ClusterIssuer` named `selfsigned` must exist (configurable via `webhook.clusterIssuerName`).
+- The webhook listens on port 9443 (configurable via `webhook.bindAddress`).
 
 ---
 
@@ -263,22 +322,37 @@ Key values:
 | `unixSocketPath` | `/var/run/pv-snapshotter/daemon.sock` | gRPC socket path |
 | `annotationPrefix` | `pv-snapshotter.humble-mun.io` | Pod annotation prefix |
 | `tolerations` | control-plane NoSchedule | Node tolerations |
+| `webhook.enabled` | `true` | Enable webhook, RBAC, cert-manager Certificate, and MutatingWebhookConfiguration |
+| `webhook.clusterIssuerName` | `selfsigned` | cert-manager ClusterIssuer for the webhook TLS certificate |
+| `webhook.objectSelector` | `matchLabels: pv-snapshotter.humble-mun.io/inject: "true"` | Only pods matching this selector are mutated |
+| `webhook.pvcNameTemplate` | `{{.OwnerName}}` | Go template → PVC name to look up |
+| `webhook.maxOwnerDepth` | `2` | Owner-reference traversal depth |
+| `webhook.defaultRuntimeClass` | `runc` | Base RuntimeClass when pod has none |
+| `webhook.runtimeClassSuffix` | `-pv` | Suffix appended to form the pv-backed RuntimeClass name |
+| `webhook.boundTimeout` | `10s` | Max wait for PVC Bound before denying the pod |
+| `webhook.stateMountPath` | `/.platform/state` | Container mount path for the injected state volume |
+| `webhook.annotationTemplates` | ZFS LocalPV defaults | Go template map for annotations (illustrative; see note below) |
 
 The chart deploys:
 - A **ConfigMap** (`daemon.yaml`) that configures the daemon via viper (loaded from `/etc/humble-mun/daemon.yaml`).
 - A **DaemonSet** with two containers:
   - `config` (native sidecar, `restartPolicy: Always`): waits for the daemon's `/readyz` endpoint, patches `/etc/containerd/config.toml` idempotently (copying the base runtime's config and adding `snapshotter = "pv-snapshotter"`), restarts containerd via a cgo nsenter preamble if needed, then blocks until Pod termination.
-  - `daemon`: the pv-snapshotter gRPC proxy snapshotter.
+  - `daemon`: the pv-snapshotter gRPC proxy snapshotter and webhook server (when enabled).
 - A **RuntimeClass** per entry in `containerdConfig.runtimeClasses`, named `<base><suffix>`.
-- A **ServiceAccount** with `automountServiceAccountToken: false` (no Kubernetes API access needed).
+- A **ServiceAccount** (`automountServiceAccountToken` follows `webhook.enabled`).
+- When `webhook.enabled=true`: a **ClusterRole** + **ClusterRoleBinding** (PVC/PV and workload controller read access), a cert-manager **Certificate**, a ClusterIP **Service** (port 9443), and a **MutatingWebhookConfiguration**.
 
 All daemon flags can be overridden via `HM_`-prefixed environment variables or entries in `daemon.yaml`.
+
+> **`webhook.annotationTemplates` note:** This field documents the default annotation template values. The Helm chart passes them as `--webhook-annotation-templates` CLI arguments on the daemon container rather than writing them to `daemon.yaml`, to preserve map key casing (viper's YAML parser lowercases all keys). To customise annotation templates, override `webhook.annotationTemplates` in your `values.yaml`.
 
 ---
 
 ## CLI Flags
 
 All flags can also be set via environment variables (uppercase, `_`-separated, prefixed with `HM_`).
+
+### Snapshotter flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -292,6 +366,67 @@ All flags can also be set via environment variables (uppercase, `_`-separated, p
 | `--overlay-snapshotter.mount-options` | `[]` | Extra mount options passed to overlayfs (**never add `volatile`**) |
 
 > ⚠️ **Never add `volatile`** to `--overlay-snapshotter.mount-options`. It causes `upperdir` data loss on unclean shutdown, directly contradicting the persistence semantics of this project.
+
+### Webhook flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--webhook-enabled` | `true` | Enable the mutating admission webhook endpoint |
+| `--webhook-pvc-name-template` | `{{.OwnerName}}` | Go template → PVC name to look up |
+| `--webhook-pvc-selector-template` | `""` | Go template → label selector; fallback when name template is empty |
+| `--webhook-max-owner-depth` | `2` | Owner-reference traversal depth (0 = pod name directly) |
+| `--webhook-default-runtime-class` | `runc` | Base RuntimeClass when pod specifies none |
+| `--webhook-runtime-class-suffix` | `-pv` | Suffix appended to the base name |
+| `--webhook-bound-timeout` | `10s` | Max wait for PVC to reach Bound before denying the pod |
+| `--webhook-state-mount-path` | `/.platform/state` | Mount path for the injected state volume |
+| `--webhook-annotation-templates` | ZFS LocalPV defaults | `key=value` CSV map of annotation key → Go template value |
+
+---
+
+## End-to-End Validation
+
+`demo.yaml` contains a Deployment and a PVC that exercise the full pipeline end-to-end. Apply it to a cluster with the Helm chart installed:
+
+```bash
+kubectl apply -f demo.yaml
+```
+
+The Deployment's pods carry the opt-in label `pv-snapshotter.humble-mun.io/inject: "true"`. The webhook resolves the owner chain (pod → ReplicaSet → Deployment `demo`), looks up PVC `demo`, waits for it to bind, then injects the state volume, annotations, and `runtimeClassName: runc-pv`.
+
+**Verify:**
+
+```bash
+# 1. PVC bound
+kubectl get pvc demo
+
+# 2. Webhook-injected fields on the pod
+POD=$(kubectl get pod -l app=demo -o name | head -1)
+kubectl get $POD -o yaml | grep -E 'runtimeClassName|pv-snapshotter|pv-snapshotter--state'
+
+# 3. Confirm upperdir is on the PVC (on the node that hosts the pod)
+NODE_POD_UID=$(kubectl get $POD -o jsonpath='{.metadata.uid}')
+# ssh <node> "findmnt -t overlay | grep $NODE_POD_UID"
+# upperdir= should point to /var/lib/kubelet/pods/<uid>/volumes/…/upper
+
+# 4. Write a sentinel file anywhere in the container's filesystem
+#    (the overlay upperdir is on the PVC, so this survives pod recreation)
+kubectl exec $POD -c demo -- sh -c 'echo ok > /tmp/sentinel.txt'
+
+# 5. Delete the pod — the ReplicaSet recreates it against the same PVC
+kubectl delete $POD
+kubectl wait --for=condition=Ready pod -l app=demo --timeout=60s
+
+# 6. Verify the file survived
+kubectl exec $(kubectl get pod -l app=demo -o name | head -1) -c demo -- \
+  cat /tmp/sentinel.txt
+# expected: ok
+```
+
+**Teardown:**
+
+```bash
+kubectl delete -f demo.yaml
+```
 
 ---
 
@@ -391,18 +526,19 @@ After pv-snapshotter restarts, existing running containers still hold their over
 
 ## Roadmap
 
-### Production Hardening (next)
+pv-snapshotter is **production ready**. Core snapshotter, Helm chart, containerd config automation, and mutating admission webhook are all implemented and verified end-to-end. The items below are optional hardening and future enhancements.
 
-- [ ] Configurable cleanup behavior on `Remove()` (forget binding vs. reclaim)
-- [ ] Node restart recovery verification
+### Optional Hardening
+
+- [ ] Configurable cleanup behavior on `Remove()` (forget binding vs. reclaim backing storage)
+- [ ] Node restart recovery — end-to-end verification that re-created pods re-attach correctly
 - [ ] Storage expansion end-to-end testing
-- [ ] Error recovery: mount failure, missing parent snapshot, CSI not ready
 - [ ] GC coordination: overlay metadata.db cleanup vs. backing storage lifecycle
 
 ### Future
 
 - [ ] Metrics endpoint (Prometheus) for mount latency and resolution errors
-- [ ] Support for Ceph RBD globalmount staging path (automatic path detection)
+- [ ] Support for Ceph RBD globalmount staging path (automatic path detection via `sha256(volumeHandle)`)
 - [ ] Multi-arch image builds (arm64)
 
 ---
