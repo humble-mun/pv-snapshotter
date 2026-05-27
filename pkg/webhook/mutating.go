@@ -1,4 +1,4 @@
-﻿package webhook
+package webhook
 
 import (
 	"bytes"
@@ -66,13 +66,13 @@ const (
 //
 // This is a two-layer template pipeline:
 //
-//   Layer 2 (webhook): variables .PVName, .OwnerName, .PodName, .VolumeHandle
-//   are resolved at admission time.  Variables .PodUID and .PodNamespace are
-//   pre-populated with their own template action text ("{{.PodUID}}" etc.) so
-//   that they pass through unchanged as annotation values.
+//	Layer 2 (webhook): variables .PVName, .OwnerName, .PodName, .VolumeHandle
+//	are resolved at admission time.  Variables .PodUID and .PodNamespace are
+//	pre-populated with their own template action text ("{{.PodUID}}" etc.) so
+//	that they pass through unchanged as annotation values.
 //
-//   Layer 3 (pv-snapshotter): the annotation value is re-rendered at Mounts()
-//   time; {{.PodUID}} is substituted with the actual pod UID.
+//	Layer 3 (pv-snapshotter): the annotation value is re-rendered at Mounts()
+//	time; {{.PodUID}} is substituted with the actual pod UID.
 //
 // Template text uses plain {{.PodUID}} (no {{ "{{" }} escaping) because these
 // defaults are registered as a pflag stringToString value.  pflag uses CSV
@@ -105,7 +105,7 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 		"Map of annotation key=Go-template-value stamped onto mutated pods. "+
 			"Template variables: .OwnerName, .PodName, .PVName, .VolumeHandle.")
 	pfs.String(flagStateMountPath, defaultStateMountPath,
-		"Container mount path for the injected state volume.")
+		"Container mount path for the injected state volume on the primary container.")
 	pfs.Duration(flagBoundTimeout, defaultBoundTimeout,
 		"How long to wait for the PVC to reach the Bound phase before denying the pod. "+
 			"pv-snapshotter cannot prepare the overlay upperdir on an unbound volume, so "+
@@ -129,9 +129,9 @@ func Enabled() bool {
 //     up to maxOwnerDepth hops.
 //  2. Looks up the PVC associated with that owner (by name template or label
 //     selector template) and waits up to boundTimeout for it to reach Bound.
-//  3. Injects a state volume/volumeMount backed by that PVC and stamps
-//     pv-snapshotter annotations onto the pod, enabling pv-backed overlay
-//     routing.
+//  3. Injects a state volume plus a primary-container-only volumeMount backed
+//     by that PVC and stamps pv-snapshotter annotations onto the pod, enabling
+//     pv-backed overlay routing.
 type Handler struct {
 	logger              logr.Logger
 	client              kubernetes.Interface
@@ -292,8 +292,8 @@ func (h *Handler) mutate(ctx context.Context, req *admissionv1.AdmissionRequest)
 	log.V(4).Info("resolved controlling owner", "ownerName", ownerName)
 
 	data := templateData{
-		OwnerName:    ownerName,
-		PodName:      req.Name,
+		OwnerName: ownerName,
+		PodName:   req.Name,
 		// Pre-populate Layer-3 pass-through fields with their own action text.
 		// Templates that reference {{.PodUID}} will output "{{.PodUID}}"
 		// literally, which pv-snapshotter re-renders at Mounts() time.
@@ -567,7 +567,9 @@ type jsonPatchOp struct {
 //
 //  1. Stamp pv-snapshotter annotations (key → rendered template value).
 //  2. Append the state volume backed by the resolved PVC.
-//  3. Append the state volumeMount to every container and init container.
+//  3. Add the state volumeMount only to the primary container
+//     (spec.containers[0]) so kubelet mounts the PVC without exposing the raw
+//     overlay upperdir to sidecars or init containers.
 //  4. Rewrite runtimeClassName to the pv-backed variant (appends the suffix).
 func (h *Handler) buildPatch(pod *corev1.Pod, pvcName string, data templateData) ([]jsonPatchOp, error) {
 	var ops []jsonPatchOp
@@ -612,19 +614,20 @@ func (h *Handler) buildPatch(pod *corev1.Pod, pvcName string, data templateData)
 		Name:      statePVCVolumeName,
 		MountPath: h.stateMountPath,
 	}
-	for i := range pod.Spec.Containers {
-		ops = append(ops, jsonPatchOp{
-			Op:    "add",
-			Path:  fmt.Sprintf("/spec/containers/%d/volumeMounts/-", i),
-			Value: stateMount,
-		})
-	}
-	for i := range pod.Spec.InitContainers {
-		ops = append(ops, jsonPatchOp{
-			Op:    "add",
-			Path:  fmt.Sprintf("/spec/initContainers/%d/volumeMounts/-", i),
-			Value: stateMount,
-		})
+	if len(pod.Spec.Containers) > 0 {
+		if pod.Spec.Containers[0].VolumeMounts == nil {
+			ops = append(ops, jsonPatchOp{
+				Op:    "add",
+				Path:  "/spec/containers/0/volumeMounts",
+				Value: []corev1.VolumeMount{stateMount},
+			})
+		} else {
+			ops = append(ops, jsonPatchOp{
+				Op:    "add",
+				Path:  "/spec/containers/0/volumeMounts/-",
+				Value: stateMount,
+			})
+		}
 	}
 
 	// ── runtimeClassName ─────────────────────────────────────────────────────

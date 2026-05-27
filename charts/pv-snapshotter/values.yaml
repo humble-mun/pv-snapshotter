@@ -103,8 +103,9 @@ webhook:
   # failure to the node.
   boundTimeout: 10s
 
-  # stateMountPath is the container path at which the injected state volume
-  # is mounted.
+  # stateMountPath is the path mounted only into the primary container
+  # (spec.containers[0]) so kubelet publishes the PVC before container
+  # creation. Workloads should not read or write this raw upperdir backing path.
   stateMountPath: "/.platform/state"
 
   # annotationTemplates is a map of annotation key → Go template value stamped

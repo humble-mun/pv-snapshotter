@@ -114,9 +114,10 @@ spec:
           ls -la /.platform/state
           echo "ready — sleeping"
           exec sleep infinity
-        # /.platform/state is injected by the webhook (volume "pv-snapshotter--state"
-        # backed by PVC "demo").  The container itself declares no volumeMounts here;
-        # they are added by the webhook at admission time.
+        # /.platform/state is injected by the webhook only into the primary
+        # container (spec.containers[0]) using volume "pv-snapshotter--state"
+        # backed by PVC "demo".  The container itself declares no volumeMounts
+        # here; the mount is added by the webhook at admission time.
         #
         # Do NOT also mount PVC "demo" at another path inside the container.
         # The PVC root is the raw overlay upperdir; upper/ and work/ subdirectories

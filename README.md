@@ -244,10 +244,10 @@ When a Pod is admitted and its labels match the configured `objectSelector` (def
 4. **Builds a JSON Patch** that:
    - Stamps `upperdir-path-template` and `var.PVName` annotations onto the pod.
    - Appends volume `pv-snapshotter--state` (backed by the PVC) to `spec.volumes`.
-   - Appends a `volumeMount` at `/.platform/state` to every container and init container.
+   - Adds a `volumeMount` at `/.platform/state` only to the primary container (`spec.containers[0]`).
    - Rewrites `runtimeClassName` to `<base>-pv` (e.g. `runc-pv`), using `defaultRuntimeClass` when the pod has none.
 
-The volume name `pv-snapshotter--state` uses the double-dash vendor separator to avoid colliding with user-defined volume names.
+The volume name `pv-snapshotter--state` uses the double-dash vendor separator to avoid colliding with user-defined volume names. The injected mount exists only to make kubelet publish the PVC before container creation; workloads should not read or write that path, and sidecars/init containers do not receive it.
 
 ### Annotation Template Pipeline
 
@@ -330,7 +330,7 @@ Key values:
 | `webhook.defaultRuntimeClass` | `runc` | Base RuntimeClass when pod has none |
 | `webhook.runtimeClassSuffix` | `-pv` | Suffix appended to form the pv-backed RuntimeClass name |
 | `webhook.boundTimeout` | `10s` | Max wait for PVC Bound before denying the pod |
-| `webhook.stateMountPath` | `/.platform/state` | Container mount path for the injected state volume |
+| `webhook.stateMountPath` | `/.platform/state` | Mount path injected into the primary container (`spec.containers[0]`) |
 | `webhook.annotationTemplates` | ZFS LocalPV defaults | Go template map for annotations (illustrative; see note below) |
 
 The chart deploys:
@@ -378,7 +378,7 @@ All flags can also be set via environment variables (uppercase, `_`-separated, p
 | `--webhook-default-runtime-class` | `runc` | Base RuntimeClass when pod specifies none |
 | `--webhook-runtime-class-suffix` | `-pv` | Suffix appended to the base name |
 | `--webhook-bound-timeout` | `10s` | Max wait for PVC to reach Bound before denying the pod |
-| `--webhook-state-mount-path` | `/.platform/state` | Mount path for the injected state volume |
+| `--webhook-state-mount-path` | `/.platform/state` | Mount path injected into the primary container (`spec.containers[0]`) |
 | `--webhook-annotation-templates` | ZFS LocalPV defaults | `key=value` CSV map of annotation key → Go template value |
 
 ---

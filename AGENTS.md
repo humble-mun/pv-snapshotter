@@ -460,7 +460,7 @@ Out-of-the-box experience: workload Pods that carry the opt-in label are automat
   - Owner traversal: follows `Controller=true` owner refs through ReplicaSet → Deployment (and any other well-known workload kinds) using the dynamic client (`Unstructured` GET); warns and takes first when multiple controller refs exist at the same level
   - PVC resolution: name-template path (default `{{.OwnerName}}`) takes precedence; falls back to label-selector template
   - Bound wait: polls every 2 s up to `boundTimeout` (default 10 s); fails hard on timeout — admitting the pod before the volume is bound only defers the failure to the node
-  - Patch operations: (1) annotations, (2) state volume `pv-snapshotter--state` backed by the PVC, (3) state `volumeMount` at `/.platform/state` injected into every container and init container, (4) `runtimeClassName` rewritten to `<base>-pv` (using `defaultRuntimeClass` when pod has none)
+  - Patch operations: (1) annotations, (2) state volume `pv-snapshotter--state` backed by the PVC, (3) state `volumeMount` at `/.platform/state` injected only into the primary container (`spec.containers[0]`), (4) `runtimeClassName` rewritten to `<base>-pv` (using `defaultRuntimeClass` when pod has none)
   - `sha256` template function available in all templates (useful for Ceph RBD `volumeHandle` paths)
 - **`charts/pv-snapshotter/templates/webhook.yaml`** — webhook-specific resources (rendered only when `webhook.enabled=true`):
   - `Service` (ClusterIP, port 9443)
