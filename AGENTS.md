@@ -388,6 +388,7 @@ v1.x has no `/v2` suffix and uses `snapshots/overlay` instead of `plugins/snapsh
 - **Do not** filter containerd containers by `snapshot_key` — `adaptContainer` silently ignores it; filter by `id` instead.
 - **Do not** silently fall back to native overlay on `ensureUpperdirReady` failure — fail hard; silent fallback causes undetected state loss.
 - **Do not** add a `pvBacked snapshots.Snapshotter` field to the snapshotter struct — the redirected path is purely a mount options rewrite, not a separate snapshotter branch.
+- **Do not** attempt to proxy all snapshot operations to containerd's built-in overlayfs via `client.SnapshotService("overlayfs")` — containerd's metadata wrapper layer transforms keys as `<namespace>/<id>/<key>` before passing them to the underlying snapshotter, so the keys that arrive at pv-snapshotter (already transformed) cannot be forwarded back through the metadata layer without double-transformation causing `not found` on Stat and `already exists` on Prepare.
 - **Do not** write `webhook-annotation-templates` to `daemon.yaml` (the viper config file) — viper's `insensitiviseMap` lowercases all map keys during YAML parsing, corrupting annotation key casing. This flag must always be passed as a CLI argument.
 - **Do not** use the `{{ "{{" }}` Go template escape syntax in `webhook-annotation-templates` flag values — pflag's `stringToString` uses a CSV parser, and bare double-quotes in a CSV field cause a parse error. Instead, pre-populate `templateData.PodUID` with the literal string `"{{.PodUID}}"` so it passes through Layer 2 unchanged.
 
@@ -488,6 +489,35 @@ The `webhook-annotation-templates` value in `values.yaml` is therefore illustrat
 
 **Note on `var.PVName`:** The default `upperdir-path-template` renders `{{.PVName}}` (a Layer-2 variable) at webhook time, substituting the actual PV name into the path. The companion `var.PVName` annotation is also stamped onto the pod with the rendered PV name, making the value available to pv-snapshotter's own template engine for any custom template that references `{{.PVName}}` at Layer 3. The Layer-2 substitution of `{{.PVName}}` in `upperdir-path-template` itself is intentional and correct — pv-snapshotter does not need to re-resolve the PV name since the webhook has already embedded it literally in the path.
 
+### Done — v0.1.4: GC fix + runtime_platforms (CURRENT RELEASE)
+
+Two bugs fixed that caused disk pressure in v0.1.3:
+
+**Bug 1 — `Cleanup()` not forwarded → orphaned snapshot directories never reclaimed.**
+
+`snapshotservice.FromSnapshotter` dispatches the gRPC Cleanup RPC via
+`s.sn.(snapshots.Cleaner)`.  Because `snapshotter` embeds `snapshots.Snapshotter`
+as an interface, the assertion always failed and returned `ErrNotImplemented`.
+Fix: introduced `cleanerSnapshotter` struct that embeds `snapshotter` and holds a
+pre-checked `snapshots.Cleaner` obtained once at startup in `RegisterGRPCService`.
+When the underlying overlay snapshotter supports `Cleanup`, `cleanerSnapshotter` is
+registered; otherwise plain `snapshotter` is used.  No per-call type assertion.
+
+**Bug 2 — Missing `runtime_platforms` → image layers not unpacked into pv-snapshotter.**
+
+`patcher.go` now injects a `runtime_platforms` block alongside each runtime block:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
+  snapshotter = "pv-snapshotter"
+```
+
+kubelet passes `runtimeHandler` in `PullImageRequest` (cri-api v0.29.0 / K8s 1.29+);
+containerd reads `runtime_platforms` and unpacks layers into pv-snapshotter
+automatically.  No manual `ctr pull --snapshotter pv-snapshotter` required.
+
+**⚠️ Do not run v0.1.3 in production** — it ships with both bugs active.
+
 ---
 
 ## Next Steps
@@ -500,7 +530,21 @@ pv-snapshotter is **production ready**. The items below are optional hardening a
 - **Node restart recovery:** After pv-snapshotter restarts, existing running containers still have their overlay mounts active (runc holds them). Verify that re-created pods referencing the same backing path correctly re-attach on next `Mounts()` call.
 - **Storage expansion:** Update `PVC.spec.resources.requests.storage` → CSI driver resizes block device → `resize2fs`/`xfs_growfs` online. No container restart required. Verify the container sees new space.
 - **Error recovery:** mount failure, missing parent snapshot, volume not yet ready when `Mounts()` is called.
-- **GC coordination:** overlay metadata.db cleanup vs. backing storage lifecycle.
+- ~~**GC coordination:** overlay metadata.db cleanup vs. backing storage lifecycle.~~ — **Fixed in v0.1.4** (see below).
+
+### Architecture decision record: why pv-snapshotter cannot proxy to containerd's overlayfs
+
+An attempt was made (post-v0.1.4) to replace the independent native overlay instance with a proxy to containerd's built-in overlayfs via `client.SnapshotService("overlayfs")`, avoiding a separate `metadata.db` and the image re-pull requirement.
+
+This approach fails because of containerd's two-layer metadata architecture:
+
+1. **Metadata wrapper layer** (`core/metadata/snapshot.go`): when containerd CRI calls `Prepare(key="sha256:abc")`, the metadata layer transforms the key to `<namespace>/<id>/<key>` (e.g. `k8s.io/2/sha256:abc`) before passing it to the underlying overlay snapshotter. This transformed key is what pv-snapshotter receives as its incoming key.
+
+2. **Double-transformation**: if pv-snapshotter forwards this already-transformed key (`k8s.io/2/sha256:abc`) back to containerd via gRPC, the metadata layer applies the transformation again, producing a key like `k8s.io/3/k8s.io/2/sha256:abc` — which never matches anything, causing `Stat` to return `not found` and `Prepare` to report `already exists` (since the CRI direct path already created the snapshot).
+
+3. **BoltDB exclusive lock**: even if the key problem were solved, BoltDB acquires an exclusive file lock when opened for writing. Two processes cannot share the same `metadata.db` file in read-write mode.
+
+**Conclusion**: pv-snapshotter must maintain its own overlay snapshotter instance (independent `rootPath`, independent `metadata.db`). Images must be pulled into pv-snapshotter explicitly before pods using `runtimeClassName: pv` can start. This is the same constraint shared by all containerd proxy snapshotters.
 
 ### Evolution principles
 
@@ -541,6 +585,40 @@ handler: pv
 - `hostPath` mount for `/var/lib/kubelet` — required for the CSI mount path to be accessible
 - The DaemonSet's own Pods **must not** set `runtimeClassName: pv`
 - Use `nodeSelector` or tolerations to restrict to target nodes
+
+### Image pull requirement
+
+pv-snapshotter maintains its own overlay snapshotter instance with a dedicated `metadata.db` under `--overlay-snapshotter.root-path`. Image layers must be unpacked into this snapshotter before any Pod using `runtimeClassName: pv` can start. If a container image was only pulled under the default `overlayfs` snapshotter, `Prepare()` will fail with `missing parent snapshot`.
+
+**Automatic unpack via `runtime_platforms` (Kubernetes 1.29+ / cri-api v0.29.0+):**
+
+The config sidecar now injects a `runtime_platforms` entry alongside each runtime entry:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
+  snapshotter = "pv-snapshotter"
+```
+
+When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, it passes `runtimeHandler="runc-pv"` in the CRI `PullImageRequest`. containerd looks up `runtime_platforms["runc-pv"].snapshotter` and unpacks the image with `pv-snapshotter` automatically. No manual `ctr pull` is required.
+
+**Manual fallback (Kubernetes < 1.29 or initial bootstrap):**
+
+```bash
+# Pull and unpack a single image into pv-snapshotter
+ctr --namespace=k8s.io images pull \
+  --snapshotter pv-snapshotter \
+  <image>:<tag>
+
+# List images already unpacked under pv-snapshotter
+ctr --namespace=k8s.io images ls \
+  --snapshotter pv-snapshotter
+
+# Verify the image layers exist in pv-snapshotter's snapshot store
+ctr --namespace=k8s.io snapshots \
+  --snapshotter pv-snapshotter ls
+```
+
+This is the same operational requirement shared by all containerd proxy snapshotters (stargz-snapshotter, nydus-snapshotter, soci-snapshotter). pv-snapshotter cannot share the default overlayfs metadata.db because BoltDB uses an exclusive file lock — only one process may open it for writing at a time.
 
 ### Startup ordering
 
@@ -622,8 +700,6 @@ ctr --namespace=k8s.io snapshots --snapshotter=pv-snapshotter info <key>
 ---
 
 ## References
-
-### containerd source
 
 - v2.x: `plugins/snapshots/overlay/overlay.go`, `plugins/snapshots/overlay/plugin/plugin.go`
 - Proxy plugin integration: `contrib/snapshotservice/`

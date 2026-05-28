@@ -43,6 +43,11 @@ const snippetFooter = "# END pv-snapshotter managed block\n"
 //  2. [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.<name>] for each
 //     runtime in params.Runtimes (if absent), cloning the base runtime's config
 //     and overriding snapshotter = "pv-snapshotter".
+//  3. [plugins."io.containerd.grpc.v1.cri".runtime_platforms.<name>] for each
+//     runtime in params.Runtimes (if absent), so that kubelet's PullImage RPC
+//     (which carries the runtimeHandler since cri-api v0.29.0 / K8s 1.29) causes
+//     containerd to unpack the image with pv-snapshotter instead of the global
+//     default snapshotter.  This eliminates the need to re-pull images manually.
 //
 // Returns modified=true when the file was changed, false when every section
 // was already present.  Returns a non-nil error on I/O or parse failures.
@@ -73,13 +78,14 @@ func Apply(params Params) (modified bool, err error) {
 
 // missingSection describes a section that needs to be injected.
 type missingSection struct {
-	// kind is "proxy_plugin" or "runtime".
+	// kind is "proxy_plugin", "runtime", or "runtime_platform".
 	kind string
 	// runtimeName is the new handler name (e.g. "runc-pv").
 	runtimeName string
 	// baseConfig is the base runtime's existing TOML sub-tree, cloned and
 	// modified to produce the new runtime entry.  May be nil when the base
 	// runtime is not present in config.toml (fresh install).
+	// Only used when kind == "runtime".
 	baseConfig map[string]any
 }
 
@@ -92,13 +98,19 @@ func collectMissing(tree map[string]any, params Params) []missingSection {
 		missing = append(missing, missingSection{kind: "proxy_plugin"})
 	}
 
-	// Check each runtime entry.
+	// Check each runtime entry and its corresponding runtime_platform entry.
 	for _, rt := range params.Runtimes {
 		if !hasRuntimeEntry(tree, rt.Name) {
 			missing = append(missing, missingSection{
 				kind:        "runtime",
 				runtimeName: rt.Name,
 				baseConfig:  lookupBaseRuntime(tree, rt.BaseRuntimeName),
+			})
+		}
+		if !hasRuntimePlatformEntry(tree, rt.Name) {
+			missing = append(missing, missingSection{
+				kind:        "runtime_platform",
+				runtimeName: rt.Name,
 			})
 		}
 	}
@@ -206,6 +218,32 @@ func hasRuntimeEntry(tree map[string]any, name string) bool {
 	return false
 }
 
+// hasRuntimePlatformEntry checks whether the runtime_platforms entry for the
+// given runtime handler name already exists.  Checks both config versions:
+//
+//	version 2: plugins."io.containerd.grpc.v1.cri".runtime_platforms.<name>
+//	version 3: plugins."io.containerd.cri.v1.runtime".runtime_platforms.<name>
+func hasRuntimePlatformEntry(tree map[string]any, name string) bool {
+	plugins, ok := tree["plugins"].(map[string]any)
+	if !ok {
+		return false
+	}
+	for _, criKey := range []string{"io.containerd.grpc.v1.cri", "io.containerd.cri.v1.runtime"} {
+		cri, ok := plugins[criKey].(map[string]any)
+		if !ok {
+			continue
+		}
+		platforms, ok := cri["runtime_platforms"].(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, ok := platforms[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
 // buildSnippet constructs the literal TOML text to append.
 // It opens with snippetHeader and closes with snippetFooter.
 func buildSnippet(socketPath string, sections []missingSection) string {
@@ -218,6 +256,8 @@ func buildSnippet(socketPath string, sections []missingSection) string {
 			sb.WriteString(proxyPluginSnippet(socketPath))
 		case "runtime":
 			sb.WriteString(runtimeSnippet(s.runtimeName, s.baseConfig))
+		case "runtime_platform":
+			sb.WriteString(runtimePlatformSnippet(s.runtimeName))
 		}
 	}
 
@@ -313,6 +353,23 @@ func indentTOML(b []byte, prefix string) []byte {
 		out = append(out, '\n')
 	}
 	return out
+}
+
+// runtimePlatformSnippet returns the TOML block that instructs containerd to
+// use pv-snapshotter when unpacking images for the given runtime handler.
+//
+// containerd's CRI image service reads this table at PullImage time: when
+// kubelet passes runtimeHandler (cri-api v0.29.0 / Kubernetes 1.29+),
+// containerd looks up runtime_platforms[runtimeHandler].snapshotter and uses
+// it instead of the global default snapshotter.  This ensures image layers are
+// unpacked into pv-snapshotter's own metadata store, so that Prepare() can
+// find the parent snapshot when a container is created — without requiring
+// manual `ctr images pull --snapshotter pv-snapshotter` on each node.
+//
+// The version-2 plugin key is used (accepted by both containerd 1.x and 2.x).
+func runtimePlatformSnippet(name string) string {
+	const criPrefix = `plugins."io.containerd.grpc.v1.cri".runtime_platforms.`
+	return fmt.Sprintf("\n[%s%s]\n  snapshotter = \"pv-snapshotter\"\n\n", criPrefix, name)
 }
 
 // appendToFile opens path in append mode and writes text.
