@@ -77,7 +77,21 @@ func RegisterGRPCService(logger logr.Logger, srv *grpc.Server) (closer io.Closer
 
 	closer = closers
 
-	wrapped := &snapshotter{logger: logger, Snapshotter: sn, resolver: res}
+	// Wrap sn in the appropriate type depending on whether the underlying
+	// overlay snapshotter implements snapshots.Cleaner (deferred directory
+	// removal after Remove()).  The type assertion is performed once here at
+	// startup so that snapshotservice.FromSnapshotter can expose the gRPC
+	// Cleanup RPC without a per-call runtime assertion inside Cleanup().
+	var wrapped snapshots.Snapshotter
+	if c, ok := sn.(snapshots.Cleaner); ok {
+		wrapped = cleanerSnapshotter{
+			snapshotter: snapshotter{logger: logger, Snapshotter: sn, resolver: res},
+			cleaner:     c,
+		}
+	} else {
+		wrapped = &snapshotter{logger: logger, Snapshotter: sn, resolver: res}
+	}
+
 	snapshotService := snapshotservice.FromSnapshotter(wrapped)
 	snapshotsv1.RegisterSnapshotsServer(srv, snapshotService)
 	return
@@ -244,4 +258,28 @@ func (sn snapshotter) Close() (err error) {
 		sn.logger.V(4).Info("Close completed")
 	}
 	return
+}
+
+// cleanerSnapshotter extends snapshotter for base snapshotters that implement
+// snapshots.Cleaner (deferred directory removal after Remove()).
+//
+// snapshotservice.FromSnapshotter dispatches the gRPC Cleanup RPC by asserting
+// the wrapped snapshotter to snapshots.Cleaner.  Because snapshotter embeds
+// snapshots.Snapshotter as an interface, Go cannot reach the concrete Cleanup
+// method through the embedding automatically.  This type holds a pre-checked
+// snapshots.Cleaner reference obtained once at startup in RegisterGRPCService,
+// eliminating the per-call runtime assertion.
+type cleanerSnapshotter struct {
+	snapshotter
+	cleaner snapshots.Cleaner
+}
+
+func (sn cleanerSnapshotter) Cleanup(ctx context.Context) error {
+	sn.logger.V(4).Info("Cleanup called")
+	if err := sn.cleaner.Cleanup(ctx); err != nil {
+		sn.logger.Error(err, "Cleanup failed")
+		return err
+	}
+	sn.logger.V(4).Info("Cleanup completed")
+	return nil
 }

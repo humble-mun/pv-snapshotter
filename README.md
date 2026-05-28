@@ -2,6 +2,12 @@
 
 > [中文文档](./README_CN.md)
 
+> ⚠️ **DO NOT USE v0.1.3 IN PRODUCTION.**  v0.1.3 has a confirmed disk-pressure
+> bug: orphaned snapshot directories accumulate indefinitely under
+> `/var/lib/containerd/snapshots/` because `Cleanup()` is never forwarded to the
+> underlying overlay snapshotter.  Nodes will eventually hit disk pressure and go
+> NotReady.  Upgrade to **v0.1.4** which fixes both root causes.
+
 A containerd proxy snapshotter that redirects an overlayfs container's writable layer (`upperdir`/`workdir`) to a caller-provided path — for example, a mounted PersistentVolume — so that writes made outside mounted volumes can land on durable storage with zero data-copy overhead.
 
 **Production ready.** Core snapshotter, Helm chart, containerd config automation, and mutating admission webhook are all implemented and verified end-to-end.
@@ -22,6 +28,7 @@ A containerd proxy snapshotter that redirects an overlayfs container's writable 
   - [Annotation Template Pipeline](#annotation-template-pipeline)
   - [Webhook Prerequisites](#webhook-prerequisites)
 - [DaemonSet Deployment](#daemonset-deployment)
+- [Image Pull Requirement](#image-pull-requirement)
 - [Helm Chart](#helm-chart)
 - [CLI Flags](#cli-flags)
 - [End-to-End Validation](#end-to-end-validation)
@@ -301,6 +308,42 @@ Required `hostPath` mounts:
 
 ---
 
+## Image Pull Requirement
+
+pv-snapshotter maintains its own overlay snapshotter instance with a dedicated `metadata.db` under `--overlay-snapshotter.root-path`. Image layers must be unpacked into this snapshotter before any Pod using `runtimeClassName: pv` can start. If a container image was only pulled under the default `overlayfs` snapshotter, `Prepare()` will fail with `missing parent snapshot`.
+
+**Automatic unpack via `runtime_platforms` (Kubernetes 1.29+ / cri-api v0.29.0+):**
+
+The config sidecar injects a `runtime_platforms` entry alongside each runtime entry:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
+  snapshotter = "pv-snapshotter"
+```
+
+When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, it passes `runtimeHandler="runc-pv"` in the CRI `PullImageRequest`. containerd looks up `runtime_platforms["runc-pv"].snapshotter` and unpacks the image with `pv-snapshotter` automatically. No manual `ctr pull` is required.
+
+**Manual fallback (Kubernetes < 1.29 or initial bootstrap):**
+
+```bash
+# Pull and unpack a single image into pv-snapshotter
+ctr --namespace=k8s.io images pull \
+  --snapshotter pv-snapshotter \
+  <image>:<tag>
+
+# List images already unpacked under pv-snapshotter
+ctr --namespace=k8s.io images ls \
+  --snapshotter pv-snapshotter
+
+# Verify the image layers exist in pv-snapshotter's snapshot store
+ctr --namespace=k8s.io snapshots \
+  --snapshotter pv-snapshotter ls
+```
+
+This is the same operational requirement shared by all containerd proxy snapshotters (stargz-snapshotter, nydus-snapshotter, soci-snapshotter). pv-snapshotter cannot share the default overlayfs `metadata.db` because BoltDB uses an exclusive file lock — only one process may open it for writing at a time.
+
+---
+
 ## Helm Chart
 
 The Helm chart is available at `charts/pv-snapshotter/`.
@@ -388,7 +431,7 @@ All flags can also be set via environment variables (uppercase, `_`-separated, p
 `demo.yaml` contains a Deployment and a PVC that exercise the full pipeline end-to-end. Apply it to a cluster with the Helm chart installed:
 
 ```bash
-kubectl apply -f demo.yaml
+kubectl apply -f docs/demo.yaml
 ```
 
 The Deployment's pods carry the opt-in label `pv-snapshotter.humble-mun.io/inject: "true"`. The webhook resolves the owner chain (pod → ReplicaSet → Deployment `demo`), looks up PVC `demo`, waits for it to bind, then injects the state volume, annotations, and `runtimeClassName: runc-pv`.
@@ -425,7 +468,7 @@ kubectl exec $(kubectl get pod -l app=demo -o name | head -1) -c demo -- \
 **Teardown:**
 
 ```bash
-kubectl delete -f demo.yaml
+kubectl delete -f docs/demo.yaml
 ```
 
 ---
@@ -524,6 +567,62 @@ After pv-snapshotter restarts, existing running containers still hold their over
 
 ---
 
+## Changelog
+
+### v0.1.4 — Disk-pressure fixes + automatic image unpack via runtime_platforms
+
+#### Bug 1 — `Cleanup()` not forwarded → orphaned snapshot directories never reclaimed
+
+**Root cause.** With `syncRemove=false` (the default), `Remove()` only deletes the
+BoltDB metadata record; the actual `os.RemoveAll` is deferred to a later `Cleanup()`
+call.  `snapshotservice.FromSnapshotter` dispatches the gRPC Cleanup RPC via a
+`snapshots.Cleaner` type assertion on the wrapped snapshotter.  Because the wrapper
+struct embedded `snapshots.Snapshotter` as an interface (not the concrete
+`*overlay.snapshotter`), the assertion always failed and returned `ErrNotImplemented`
+— so every deleted container left a permanent orphaned directory on disk.  Nodes
+running v0.1.3 accumulate these directories without bound and eventually hit disk
+pressure.
+
+**Fix.** Introduced `cleanerSnapshotter`, a thin wrapper around `snapshotter` that
+holds a pre-checked `snapshots.Cleaner` reference obtained once at startup in
+`RegisterGRPCService`.  `cleanerSnapshotter.Cleanup()` delegates directly to the
+inner cleaner with no per-call type assertion.  When the underlying snapshotter does
+not implement `snapshots.Cleaner`, the plain `snapshotter` is used instead (no
+`Cleanup` exposed).
+
+#### Bug 2 — Missing `runtime_platforms` → image layers not unpacked into pv-snapshotter
+
+**Root cause.** containerd selects a snapshotter for image unpack based on the
+`runtimeHandler` field that kubelet passes in the CRI `PullImageRequest`
+(cri-api v0.29.0 / Kubernetes 1.29+).  Without a matching entry in
+`runtime_platforms`, containerd fell back to the global default snapshotter
+(`overlayfs`) for image unpack, but used pv-snapshotter for container creation —
+causing `missing parent snapshot` errors.
+
+**Fix.** The config sidecar (`patcher.go`) now injects a `runtime_platforms` entry
+alongside each runtime entry:
+
+```toml
+[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
+  snapshotter = "pv-snapshotter"
+```
+
+When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, containerd
+automatically unpacks the image into pv-snapshotter.  No manual `ctr pull` required
+on Kubernetes 1.29+.
+
+#### Disk pressure incident — root-cause summary
+
+v0.1.3 shipped with both bugs active simultaneously:
+
+1. Image layers were unpacked into the default overlayfs, not pv-snapshotter →
+   `Prepare()` reported `missing parent snapshot` on container creation.
+2. Deleted containers left permanent orphaned directories → disk grew without bound.
+
+**Do not run v0.1.3 in production.**  Upgrade to v0.1.4.
+
+---
+
 ## Roadmap
 
 pv-snapshotter is **production ready**. Core snapshotter, Helm chart, containerd config automation, and mutating admission webhook are all implemented and verified end-to-end. The items below are optional hardening and future enhancements.
@@ -533,7 +632,7 @@ pv-snapshotter is **production ready**. Core snapshotter, Helm chart, containerd
 - [ ] Configurable cleanup behavior on `Remove()` (forget binding vs. reclaim backing storage)
 - [ ] Node restart recovery — end-to-end verification that re-created pods re-attach correctly
 - [ ] Storage expansion end-to-end testing
-- [ ] GC coordination: overlay metadata.db cleanup vs. backing storage lifecycle
+- ~~GC coordination: overlay metadata.db cleanup vs. backing storage lifecycle~~ — **Fixed in v0.1.4**
 
 ### Future
 
