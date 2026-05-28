@@ -1,0 +1,88 @@
+# pv-snapshotter v0.1.4 recovery DaemonSet.
+#
+# Drops the stale `v1/<ns>/snapshots/pv-snapshotter` bucket from containerd's
+# main metadata on each polluted node and triggers a single explicit
+# image.Unpack of the sandbox (pause) image to repopulate pv-snapshotter's
+# own metadata.db consistently.
+#
+# Per-node impact: ~5–10s containerd downtime (stop → fix-meta single
+# transaction → start → ctr pull --local single layer).  Running containers
+# are NOT affected by the restart (overlay mounts are kernel-held); only
+# in-flight CRI calls are interrupted.
+#
+# IMPORTANT — rollout safety: this DaemonSet uses a `nodeSelector` so only
+# nodes labelled `pv-snapshotter-recover/enabled=true` receive the recovery
+# Pod.  `maxUnavailable: 1` ONLY governs rolling updates (spec changes), NOT
+# initial Pod scheduling.  If you label many nodes at once, their containerd
+# restarts will run roughly in parallel, briefly blocking new Pod creation
+# cluster-wide.  Recommended pattern: label nodes in waves (one, then ten,
+# then the rest) and wait for each wave's markers before adding the next.
+# See README.md for the exact commands.
+#
+# Safe to re-apply: the script short-circuits on a host marker file.
+# Safe to remove once all nodes have completed: the systemd transient unit
+# is `--collect`-cleaned automatically; only the marker file remains.
+#
+# Build & push the recovery image first (see ./Dockerfile and README.md).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pv-snapshotter-recover
+  namespace: kube-system
+  labels:
+    app: pv-snapshotter-recover
+spec:
+  selector:
+    matchLabels:
+      app: pv-snapshotter-recover
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: pv-snapshotter-recover
+    spec:
+      hostPID: true
+
+      tolerations:
+      - operator: Exists
+
+      # Nodes are opted-in via this label.  Add the label to a node to schedule
+      # the recovery Pod on it; remove the label (or leave it absent) to skip
+      # that node.  See README.md for the wave-rollout commands.
+      nodeSelector:
+        pv-snapshotter-recover/enabled: "true"
+
+      priorityClassName: system-node-critical
+
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+
+      containers:
+      - name: recover
+        image: harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v1
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        env:
+        - name: HM_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+          mountPropagation: HostToContainer
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi

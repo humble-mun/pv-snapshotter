@@ -1,0 +1,81 @@
+# migrate-v0.1.4.yaml
+#
+# One-shot DaemonSet to remove every "# BEGIN pv-snapshotter managed block
+# ... # END" region from /etc/containerd/config.toml on the target node.
+# Containerd is NOT restarted; the change takes effect the next time the
+# pv-snapshotter config sidecar runs and re-injects a clean managed block.
+#
+# nodeSelector limits this DaemonSet to a single node for safe rollout.
+# Update kubernetes.io/hostname before applying to additional nodes.
+#
+# Usage:
+#   kubectl apply -f docs/migrate-v0.1.4.yaml
+#   kubectl -n kube-system logs -l app=pv-snapshotter-migrate --prefix | grep Sleeping
+#   kubectl delete -f docs/migrate-v0.1.4.yaml
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pv-snapshotter-migrate
+  namespace: kube-system
+  labels:
+    app: pv-snapshotter-migrate
+spec:
+  selector:
+    matchLabels:
+      app: pv-snapshotter-migrate
+  template:
+    metadata:
+      labels:
+        app: pv-snapshotter-migrate
+    spec:
+      tolerations:
+      - operator: Exists
+
+      # Restrict rollout to a single node first; widen this once verified.
+      nodeSelector:
+        kubernetes.io/hostname: "10.254.17.24"
+
+      volumes:
+      - name: containerd-config
+        hostPath:
+          path: /etc/containerd
+          type: Directory
+
+      containers:
+      - name: migrate
+        image: ubuntu:noble-20251013
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: containerd-config
+          mountPath: /etc/containerd
+        command: ["bash", "-c"]
+        args:
+        - |
+          set -uo pipefail
+          log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+
+          CONFIG_TOML=/etc/containerd/config.toml
+
+          if [[ ! -f "${CONFIG_TOML}" ]]; then
+            log "${CONFIG_TOML} not found; nothing to do."
+            log "Sleeping — safe to delete DaemonSet."
+            sleep infinity
+          fi
+
+          blocks=$(grep -c "# BEGIN pv-snapshotter managed block" "${CONFIG_TOML}" || true)
+          if [[ "${blocks}" -gt 0 ]]; then
+            log "Stripping ${blocks} managed block(s) from ${CONFIG_TOML} ..."
+            sed -i '/# BEGIN pv-snapshotter managed block/,/# END pv-snapshotter managed block/d' \
+              "${CONFIG_TOML}"
+            log "Done.  containerd will pick up the change the next time it"
+            log "is restarted (i.e. when the pv-snapshotter config sidecar"
+            log "restarts on this node and re-injects a clean managed block)."
+          else
+            log "No managed blocks found in ${CONFIG_TOML}; nothing to do."
+          fi
+
+          log "Migration complete on $(hostname)."
+          log "Sleeping — safe to delete DaemonSet."
+          sleep infinity

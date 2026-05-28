@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pv-snapshotter-debug
+  namespace: kube-system
+  labels:
+    app: pv-snapshotter-debug
+spec:
+  selector:
+    matchLabels:
+      app: pv-snapshotter-debug
+  template:
+    metadata:
+      labels:
+        app: pv-snapshotter-debug
+    spec:
+      tolerations:
+      - operator: Exists
+      hostPID: true
+
+      volumes:
+      - name: containerd-root
+        hostPath:
+          path: /var/lib/containerd
+          type: Directory
+      - name: containerd-run
+        hostPath:
+          path: /run/containerd
+          type: Directory
+      - name: host-ctr
+        hostPath:
+          path: /usr/local/bin/ctr
+          type: File
+      - name: containerd-config
+        hostPath:
+          path: /etc/containerd
+          type: Directory
+
+      containers:
+      - name: shell
+        image: ubuntu:noble-20251013
+        imagePullPolicy: IfNotPresent
+        securityContext:
+          privileged: true
+        volumeMounts:
+        - name: containerd-root
+          mountPath: /var/lib/containerd
+        - name: containerd-run
+          mountPath: /run/containerd
+        - name: host-ctr
+          mountPath: /usr/local/bin/ctr
+        - name: containerd-config
+          mountPath: /etc/containerd
+          readOnly: true
+        command: ["sleep", "infinity"]
