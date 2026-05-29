@@ -1,0 +1,79 @@
+# pv-snapshotter recovery CLEANUP DaemonSet.
+#
+# Removes the per-node host-side state left by the recovery DaemonSet
+# (pv-snapshotter-recover) so a node can be re-experimented on from a clean
+# slate.  See cleanup.sh for exactly what is removed.  This DaemonSet does NOT
+# stop containerd or touch metadata/snapshots — it only clears recovery tooling
+# artifacts.
+#
+# Reuses the same recovery image (which now ships cleanup.sh alongside
+# recover.sh) and overrides the entrypoint via `command`.
+#
+# Opt-in per node with the label:
+#   kubectl label node <NODE> pv-snapshotter-recover-cleanup/enabled=true
+#
+# To also purge the meta.db backups, set CLEAN_BACKUPS=true in env below
+# (default keeps them as a rollback safety net).
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: pv-snapshotter-recover-cleanup
+  namespace: kube-system
+  labels:
+    app: pv-snapshotter-recover-cleanup
+spec:
+  selector:
+    matchLabels:
+      app: pv-snapshotter-recover-cleanup
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+  template:
+    metadata:
+      labels:
+        app: pv-snapshotter-recover-cleanup
+    spec:
+      hostPID: true
+
+      tolerations:
+      - operator: Exists
+
+      nodeSelector:
+        pv-snapshotter-recover-cleanup/enabled: "true"
+
+      priorityClassName: system-node-critical
+
+      volumes:
+      - name: host-root
+        hostPath:
+          path: /
+          type: Directory
+
+      containers:
+      - name: cleanup
+        image: harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3
+        imagePullPolicy: IfNotPresent
+        command: ["/usr/local/bin/cleanup.sh"]
+        securityContext:
+          privileged: true
+          runAsUser: 0
+        env:
+        - name: HM_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        # Set to "true" to also delete meta.db.recover-* / meta.db.fix-meta-backup-*
+        - name: CLEAN_BACKUPS
+          value: "false"
+        volumeMounts:
+        - name: host-root
+          mountPath: /host
+          mountPropagation: HostToContainer
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 200m
+            memory: 128Mi

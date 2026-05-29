@@ -89,6 +89,8 @@ fi
 log "staging fix-meta and inner recovery script on host ..."
 cp /usr/local/bin/fix-meta /host/var/tmp/pv-recover-fix-meta
 chmod +x /host/var/tmp/pv-recover-fix-meta
+cp /usr/local/bin/prune-images /host/var/tmp/pv-recover-prune-images
+chmod +x /host/var/tmp/pv-recover-prune-images
 
 # The inner script runs in HOST context as a systemd transient unit. Variables
 # referenced with ${VAR} are substituted at OUTER (this-script) time; variables
@@ -154,6 +156,18 @@ fi
 log "triggering image.Unpack via ctr pull --local --snapshotter pv-snapshotter \${SANDBOX_IMAGE} ..."
 ctr -n k8s.io image pull -k --local \
   --snapshotter pv-snapshotter "\${SANDBOX_IMAGE}" >> "\${LOG}" 2>&1
+
+# Gap2 fix (doc §5.4 缺口2): the v0.1.4 GC reclaimed layer blobs but left image
+# records intact, so kubelet's PullIfNotPresent reports "image present", skips
+# PullImage, and the on-demand unpack fails forever.  prune-images deletes ONLY
+# the image records whose THIS-NODE-PLATFORM config/layer blobs are actually
+# missing (platform-scoped, doc §6) so kubelet re-pulls them.  Runs against the
+# now-running containerd socket, before kubelet is brought back up.  Failure here
+# is non-fatal: log and continue (the worst case is a stale record kubelet still
+# skips, which the next recovery run will catch).
+log "pruning broken image records via prune-images --apply ..."
+/var/tmp/pv-recover-prune-images --apply >> "\${LOG}" 2>&1 \
+  || log "WARN: prune-images returned non-zero; continuing"
 
 log "starting kubelet ..."
 systemctl start kubelet

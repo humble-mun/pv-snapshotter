@@ -23,8 +23,16 @@ For each polluted node, in order:
    7. `ctr -n k8s.io image pull -k --local --snapshotter pv-snapshotter
       <pause>` (this is the call that triggers `image.Unpack` and consistently
       populates pv-snapshotter's own metadata.db)
-   8. `systemctl start kubelet`
-   9. write marker file `/var/lib/pv-snapshotter-recover.done`
+   8. `prune-images --apply` — delete image **records** whose backing blobs for
+      **this node's platform** (e.g. amd64) are actually missing from the
+      content store, forcing kubelet to re-pull them. Fixes the v0.1.4 §5.4
+      缺口2 deadlock (manifest record present but layer blobs GC'd → kubelet
+      skips PullImage → on-demand unpack fails). Platform-scoped per doc §6 —
+      it does **not** use `ctr images check` incomplete (the §5.6 trap that
+      misjudges healthy multi-arch images). Non-fatal: a non-zero exit is
+      logged and recovery continues.
+   9. `systemctl start kubelet`
+   10. write marker file `/var/lib/pv-snapshotter-recover.done`
 
 The full recovery runs as a **transient systemd unit on the host**
 (`pv-snapshotter-recover.service`), launched via `systemd-run`.  The unit
@@ -49,12 +57,13 @@ survives the containerd restart that kills the DaemonSet pod.
 ```bash
 cd docs/recover-v0.1.4/
 
-# Stage fix-meta binary into the build context.
+# Stage binaries into the build context.
 cp ../fix-meta/fix-meta-linux-amd64 ./fix-meta
+cp ../prune-images/prune-images-linux-amd64 ./prune-images
 
 # Build & push.
-docker build -t harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v1 .
-docker push   harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v1
+docker build -t harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3 .
+docker push   harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3
 ```
 
 ### Step 2 — deploy the DaemonSet (no Pods yet — no nodes labelled)
@@ -173,7 +182,44 @@ rm /var/lib/pv-snapshotter-recover.done   # to allow re-attempt
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Builds the recovery image: ubuntu + fix-meta + recover.sh |
-| `recover.sh` | DaemonSet entrypoint; orchestrates the recovery |
+| `Dockerfile` | Builds the recovery image (`:v2`): ubuntu + fix-meta + recover.sh + cleanup.sh |
+| `recover.sh` | DaemonSet entrypoint; orchestrates the recovery (fix-meta drop + sandbox re-unpack) |
 | `daemonset.yaml` | Privileged DaemonSet that runs `recover.sh` on each node |
+| `cleanup.sh` | Removes per-node host-side recovery artifacts (unit, marker, tmp files; optional backups) |
+| `cleanup-daemonset.yaml` | Runs `cleanup.sh`; scoped via `pv-snapshotter-recover-cleanup/enabled=true` |
 | `README.md` | This file |
+
+## Cleanup between runs (v2)
+
+The `:v3` image bundles `cleanup.sh` so a node's host-side recovery state
+(transient systemd unit, marker, tmp files; optional meta.db backups) can be
+reset — useful for re-running on a node that already has the `recovered`
+marker.
+
+Rebuild the image with both scripts:
+
+```bash
+cd docs/recover-v0.1.4/
+cp ../fix-meta/fix-meta-linux-amd64 ./fix-meta
+cp ../prune-images/prune-images-linux-amd64 ./prune-images
+docker build -t harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3 .
+docker push   harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3
+```
+
+Reset a node:
+
+```bash
+kubectl apply -f cleanup-daemonset.yaml
+kubectl label node <NODE> pv-snapshotter-recover-cleanup/enabled=true
+# (set CLEAN_BACKUPS=true in cleanup-daemonset.yaml to also purge meta.db backups)
+```
+
+> NOTE on automated image-record repair: an earlier idea was to auto-`ctr images
+> rm` every image `ctr images check` reports as "incomplete", to break the
+> half-populated-record deadlock.  Empirically this is **unsafe**: `ctr images
+> check` reports "incomplete" for healthy, runnable images too (multi-arch index
+> siblings, attestation/SBOM blobs, partially-GC'd-but-amd64-complete images) —
+> the recovery image itself shows `incomplete (5/6)` while running fine.  Any
+> automated repair must instead resolve the node-platform manifest and verify
+> only its own config+layers, which `ctr images check` cannot express; do it
+> with a platform-scoped tool, never a blanket "incomplete" sweep.

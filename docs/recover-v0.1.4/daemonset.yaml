@@ -65,7 +65,7 @@ spec:
 
       containers:
       - name: recover
-        image: harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v1
+        image: harbor.smoothcloud.com.cn/system/pv-snapshotter-recover:v3
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
