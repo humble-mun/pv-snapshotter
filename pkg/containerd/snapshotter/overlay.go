@@ -12,7 +12,7 @@ import (
 
 const (
 	flagOverlaySnapshotterConfig = "overlay-snapshotter"
-	defaultRootPath              = "/var/lib/containerd"
+	defaultRootPath              = "/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter"
 )
 
 // vendor/github.com/containerd/containerd/plugins/snapshots/overlay/plugin/plugin.go

@@ -6,7 +6,8 @@
 > bug: orphaned snapshot directories accumulate indefinitely under
 > `/var/lib/containerd/snapshots/` because `Cleanup()` is never forwarded to the
 > underlying overlay snapshotter.  Nodes will eventually hit disk pressure and go
-> NotReady.  Upgrade to **v0.1.4** which fixes both root causes.
+> NotReady.  Upgrade to **v0.1.4 or later** which forwards the `Cleanup()` gRPC
+> call and reclaims orphaned directories.
 
 A containerd proxy snapshotter that redirects an overlayfs container's writable layer (`upperdir`/`workdir`) to a caller-provided path — for example, a mounted PersistentVolume — so that writes made outside mounted volumes can land on durable storage with zero data-copy overhead.
 
@@ -312,16 +313,11 @@ Required `hostPath` mounts:
 
 pv-snapshotter maintains its own overlay snapshotter instance with a dedicated `metadata.db` under `--overlay-snapshotter.root-path`. Image layers must be unpacked into this snapshotter before any Pod using `runtimeClassName: pv` can start. If a container image was only pulled under the default `overlayfs` snapshotter, `Prepare()` will fail with `missing parent snapshot`.
 
-**Automatic unpack via `runtime_platforms` (Kubernetes 1.29+ / cri-api v0.29.0+):**
+**Automatic unpack via CRI on-demand (no extra config):**
 
-The config sidecar injects a `runtime_platforms` entry alongside each runtime entry:
+You do **not** need `runtime_platforms` or any manual step on a healthy cluster. When kubelet calls `CreateContainer` for a Pod whose `runtimeClassName` routes to pv-snapshotter, containerd's CRI layer unpacks the image's layers into the container's snapshotter (pv-snapshotter) on demand, right before the container is created. The first such container for a given image pays a one-time sequential-unpack cost into pv-snapshotter's own `metadata.db`; subsequent containers reuse it.
 
-```toml
-[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
-  snapshotter = "pv-snapshotter"
-```
-
-When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, it passes `runtimeHandler="runc-pv"` in the CRI `PullImageRequest`. containerd looks up `runtime_platforms["runc-pv"].snapshotter` and unpacks the image with `pv-snapshotter` automatically. No manual `ctr pull` is required.
+> Because pv-snapshotter does not advertise the `rebase` capability, this unpack is sequential. For very large images the unpack can be slow — ensure kubelet's `runtimeRequestTimeout` is generous enough (e.g. 5m) so a slow first unpack is not cancelled mid-extraction.
 
 **Manual fallback (Kubernetes < 1.29 or initial bootstrap):**
 
@@ -402,7 +398,7 @@ All flags can also be set via environment variables (uppercase, `_`-separated, p
 | `--unix-socket-path` | `/var/run/pv-snapshotter/daemon.sock` | gRPC listener socket path |
 | `--containerd-socket` | `/run/containerd/containerd.sock` | containerd client socket |
 | `--annotation-prefix` | `pv-snapshotter.humble-mun.io` | DNS subdomain prefix for Pod annotations (RFC 1123, no reserved domains) |
-| `--overlay-snapshotter.root-path` | `/var/lib/containerd` | Native overlay snapshotter root |
+| `--overlay-snapshotter.root-path` | `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter` | Native overlay snapshotter root |
 | `--overlay-snapshotter.upper-dir-label` | `false` | Stamp `containerd.io/snapshot/overlay.upperdir` label on snapshots |
 | `--overlay-snapshotter.sync-remove` | `false` | Synchronous snapshot removal |
 | `--overlay-snapshotter.slow-chown` | `false` | Slow chown for ID-mapped mounts |
@@ -494,7 +490,7 @@ ctr --namespace=k8s.io run --snapshotter=pv-snapshotter --rm -t docker.io/librar
 ```bash
 # On the node — find the container's overlay mount
 findmnt -t overlay
-# Verify upperdir= points to the provided path, not /var/lib/containerd/snapshots/...
+# Verify upperdir= points to the provided path, not /var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter/snapshots/...
 ```
 
 ### Log verbosity
@@ -567,11 +563,77 @@ After pv-snapshotter restarts, existing running containers still hold their over
 
 ---
 
+## Upgrade Notes
+
+### Migrating `rootPath` when upgrading from v0.1.4 or earlier
+
+Starting with **v0.1.5**, the default snapshotter root path moved from
+`/var/lib/containerd` to
+`/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter`
+(Helm value `overlaySnapshotter.rootPath` and the Go fallback default).
+
+> **No migration needed if you keep the old path.** The new default only affects
+> the *default* value. If you explicitly set `overlaySnapshotter.rootPath:
+> /var/lib/containerd` (the v0.1.4 value), upgrading to v0.1.5 is a transparent
+> drop-in — pv-snapshotter keeps using the existing `snapshots/` and `metadata.db`,
+> and none of the steps below apply. The migration below is only required if you
+> *also* choose to adopt the new default path.
+
+This change is **not transparent on a node that already ran v0.1.4 or earlier**.
+pv-snapshotter keeps its own `snapshots/` directory and `metadata.db` directly
+under `rootPath`. If you simply change `rootPath` and restart:
+
+- The new `metadata.db` starts empty and has no record of the existing snapshots.
+- Image layers previously unpacked into pv-snapshotter are stranded under the old
+  path; `Prepare()` reports `missing parent snapshot` for affected images.
+- Running containers keep working (runc holds their overlay mounts), but newly
+  created Pods using `runtimeClassName: pv` may fail until the affected images are
+  re-unpacked.
+
+**Recommended migration (fresh start on the new path):**
+
+1. Cordon and drain the node so no `runtimeClassName: pv` Pods are scheduled.
+2. Stop pv-snapshotter, then containerd.
+3. Either move the old data into the new location, or start clean on the new path
+   and let containerd re-unpack images on demand at `CreateContainer` time
+   (RuntimeClass routing handles this automatically; no manual `ctr pull` is needed
+   on Kubernetes 1.29+).
+4. Restart containerd and pv-snapshotter; uncordon the node.
+
+**If your node carries leftover stale metadata from the v0.1.4 disk-pressure
+incident** (orphaned `pv-snapshotter` BoltDB buckets, or image records whose
+backing blobs were GC'd), use the dedicated recovery tooling on the
+[`docs/v0.1.4-recovery-tooling`](https://github.com/humble-mun/pv-snapshotter/tree/docs/v0.1.4-recovery-tooling)
+branch:
+
+- `docs/fix-meta/` — offline BoltDB tool that drops stale `pv-snapshotter`
+  snapshot buckets from containerd's main `metadata.db` (SHA-256-verified backup,
+  dry-run by default, `--apply` to commit).
+- `docs/prune-images/` — platform-scoped tool that deletes image **records** whose
+  this-node-platform config/layer blobs are actually missing, forcing kubelet to
+  re-pull (fixes the "image looks present but cannot unpack" deadlock).
+- `docs/recover-v0.1.4/` — a self-contained recovery DaemonSet that wires both
+  tools together per node, plus a cleanup DaemonSet for removing the per-node
+  recovery artifacts afterward. See that branch's `docs/recover-v0.1.4/README.md`
+  for the full runbook.
+
+---
+
 ## Changelog
 
-### v0.1.4 — Disk-pressure fixes + automatic image unpack via runtime_platforms
+### v0.1.5 — Conventional snapshotter root path + upgrade guidance
 
-#### Bug 1 — `Cleanup()` not forwarded → orphaned snapshot directories never reclaimed
+- **Default `rootPath` moved** to `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter`,
+  following the `io.containerd.snapshotter.v1.<name>` convention. pv-snapshotter's
+  own `snapshots/` and `metadata.db` now live in a self-contained subtree instead
+  of loose at the root of containerd's data dir. Applies to the Helm chart default
+  (`overlaySnapshotter.rootPath`) and the Go fallback default.
+- **Fresh-install only.** Relocating `rootPath` on a node that already has
+  pv-snapshotter snapshots strands the prior snapshots and `metadata.db`. See
+  [Upgrade Notes](#upgrade-notes) for the migration path when upgrading from
+  v0.1.4 or earlier.
+
+### v0.1.4 — Fix GC disk accumulation (forward the `Cleanup()` gRPC call)
 
 **Root cause.** With `syncRemove=false` (the default), `Remove()` only deletes the
 BoltDB metadata record; the actual `os.RemoveAll` is deferred to a later `Cleanup()`
@@ -590,36 +652,7 @@ inner cleaner with no per-call type assertion.  When the underlying snapshotter 
 not implement `snapshots.Cleaner`, the plain `snapshotter` is used instead (no
 `Cleanup` exposed).
 
-#### Bug 2 — Missing `runtime_platforms` → image layers not unpacked into pv-snapshotter
-
-**Root cause.** containerd selects a snapshotter for image unpack based on the
-`runtimeHandler` field that kubelet passes in the CRI `PullImageRequest`
-(cri-api v0.29.0 / Kubernetes 1.29+).  Without a matching entry in
-`runtime_platforms`, containerd fell back to the global default snapshotter
-(`overlayfs`) for image unpack, but used pv-snapshotter for container creation —
-causing `missing parent snapshot` errors.
-
-**Fix.** The config sidecar (`patcher.go`) now injects a `runtime_platforms` entry
-alongside each runtime entry:
-
-```toml
-[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
-  snapshotter = "pv-snapshotter"
-```
-
-When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, containerd
-automatically unpacks the image into pv-snapshotter.  No manual `ctr pull` required
-on Kubernetes 1.29+.
-
-#### Disk pressure incident — root-cause summary
-
-v0.1.3 shipped with both bugs active simultaneously:
-
-1. Image layers were unpacked into the default overlayfs, not pv-snapshotter →
-   `Prepare()` reported `missing parent snapshot` on container creation.
-2. Deleted containers left permanent orphaned directories → disk grew without bound.
-
-**Do not run v0.1.3 in production.**  Upgrade to v0.1.4.
+**Do not run v0.1.3 in production.**  Upgrade to v0.1.4 or later.
 
 ---
 

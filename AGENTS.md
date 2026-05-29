@@ -281,7 +281,7 @@ No `pvBacked` field. There is no separate branch snapshotter. The redirected pat
 | `--unix-socket-path` | `/var/run/pv-snapshotter/daemon.sock` | gRPC listener socket |
 | `--containerd-socket` | `/run/containerd/containerd.sock` | containerd client socket |
 | `--annotation-prefix` | `pv-snapshotter.humble-mun.io` | Pod annotation DNS subdomain prefix; all three annotation keys derived from this at startup |
-| `--overlay-snapshotter.root-path` | `/var/lib/containerd` | Native overlay snapshotter root |
+| `--overlay-snapshotter.root-path` | `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter` | Native overlay snapshotter root (pv-snapshotter's own `snapshots/` + `metadata.db`) |
 | `--overlay-snapshotter.upper-dir-label` | `false` | Enable `containerd.io/snapshot/overlay.upperdir` label on snapshots |
 | `--overlay-snapshotter.sync-remove` | `false` | Synchronous snapshot removal |
 | `--overlay-snapshotter.slow-chown` | `false` | Slow chown for ID-mapped mounts |
@@ -489,11 +489,11 @@ The `webhook-annotation-templates` value in `values.yaml` is therefore illustrat
 
 **Note on `var.PVName`:** The default `upperdir-path-template` renders `{{.PVName}}` (a Layer-2 variable) at webhook time, substituting the actual PV name into the path. The companion `var.PVName` annotation is also stamped onto the pod with the rendered PV name, making the value available to pv-snapshotter's own template engine for any custom template that references `{{.PVName}}` at Layer 3. The Layer-2 substitution of `{{.PVName}}` in `upperdir-path-template` itself is intentional and correct — pv-snapshotter does not need to re-resolve the PV name since the webhook has already embedded it literally in the path.
 
-### Done — v0.1.4: GC fix + runtime_platforms (CURRENT RELEASE)
+### Done — v0.1.4: GC fix (CURRENT RELEASE)
 
-Two bugs fixed that caused disk pressure in v0.1.3:
+One bug fixed that caused disk pressure in v0.1.3:
 
-**Bug 1 — `Cleanup()` not forwarded → orphaned snapshot directories never reclaimed.**
+**`Cleanup()` not forwarded → orphaned snapshot directories never reclaimed.**
 
 `snapshotservice.FromSnapshotter` dispatches the gRPC Cleanup RPC via
 `s.sn.(snapshots.Cleaner)`.  Because `snapshotter` embeds `snapshots.Snapshotter`
@@ -503,20 +503,16 @@ pre-checked `snapshots.Cleaner` obtained once at startup in `RegisterGRPCService
 When the underlying overlay snapshotter supports `Cleanup`, `cleanerSnapshotter` is
 registered; otherwise plain `snapshotter` is used.  No per-call type assertion.
 
-**Bug 2 — Missing `runtime_platforms` → image layers not unpacked into pv-snapshotter.**
+**Image unpack is handled by CRI on-demand, not by `runtime_platforms`.** A
+`runtime_platforms` injection was prototyped and **reverted** — it caused
+metadata/image-record pollution in production. The clean build does NOT inject
+`runtime_platforms`. Image layers are unpacked into pv-snapshotter automatically
+because containerd's CRI layer unpacks the image into the container's snapshotter
+on demand at `CreateContainer` time (driven purely by RuntimeClass routing). The
+unpack is sequential (pv-snapshotter does not advertise `rebase`); for very large
+images ensure kubelet's `runtimeRequestTimeout` is generous (e.g. 5m).
 
-`patcher.go` now injects a `runtime_platforms` block alongside each runtime block:
-
-```toml
-[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
-  snapshotter = "pv-snapshotter"
-```
-
-kubelet passes `runtimeHandler` in `PullImageRequest` (cri-api v0.29.0 / K8s 1.29+);
-containerd reads `runtime_platforms` and unpacks layers into pv-snapshotter
-automatically.  No manual `ctr pull --snapshotter pv-snapshotter` required.
-
-**⚠️ Do not run v0.1.3 in production** — it ships with both bugs active.
+**⚠️ Do not run v0.1.3 in production** — it ships with the `Cleanup()` bug active.
 
 ---
 
@@ -590,16 +586,11 @@ handler: pv
 
 pv-snapshotter maintains its own overlay snapshotter instance with a dedicated `metadata.db` under `--overlay-snapshotter.root-path`. Image layers must be unpacked into this snapshotter before any Pod using `runtimeClassName: pv` can start. If a container image was only pulled under the default `overlayfs` snapshotter, `Prepare()` will fail with `missing parent snapshot`.
 
-**Automatic unpack via `runtime_platforms` (Kubernetes 1.29+ / cri-api v0.29.0+):**
+**Automatic unpack via CRI on-demand (no `runtime_platforms`, no manual step):**
 
-The config sidecar now injects a `runtime_platforms` entry alongside each runtime entry:
+On a healthy cluster, no extra config is required. When kubelet calls `CreateContainer` for a Pod whose `runtimeClassName` routes to pv-snapshotter, containerd's CRI layer unpacks the image's layers into the container's snapshotter (pv-snapshotter) on demand, right before container creation — driven purely by RuntimeClass routing. The first container for a given image pays a one-time sequential unpack into pv-snapshotter's own `metadata.db`; later containers reuse it.
 
-```toml
-[plugins."io.containerd.grpc.v1.cri".runtime_platforms.runc-pv]
-  snapshotter = "pv-snapshotter"
-```
-
-When kubelet pulls an image for a Pod with `runtimeClassName: runc-pv`, it passes `runtimeHandler="runc-pv"` in the CRI `PullImageRequest`. containerd looks up `runtime_platforms["runc-pv"].snapshotter` and unpacks the image with `pv-snapshotter` automatically. No manual `ctr pull` is required.
+> A `runtime_platforms` injection was prototyped and **reverted** — it caused metadata/image-record pollution in production. The clean build does NOT inject `runtime_platforms`. Because pv-snapshotter does not advertise `rebase`, the on-demand unpack is sequential; for very large images ensure kubelet's `runtimeRequestTimeout` is generous (e.g. 5m) so a slow first unpack is not cancelled mid-extraction.
 
 **Manual fallback (Kubernetes < 1.29 or initial bootstrap):**
 
@@ -667,7 +658,7 @@ Inside the container or via `findmnt` on the node:
 ```bash
 # On node — find the container's overlay mount
 findmnt -t overlay
-# Confirm upperdir= points to the provided path, not /var/lib/containerd/snapshots/...
+# Confirm upperdir= points to the provided path, not /var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter/snapshots/...
 ```
 
 ### Confirm state persistence

@@ -21,7 +21,13 @@ annotationPrefix: pv-snapshotter.humble-mun.io
 
 # overlaySnapshotter holds options forwarded to the native overlay snapshotter.
 overlaySnapshotter:
-  rootPath: /var/lib/containerd
+  # rootPath is the data dir for pv-snapshotter's own overlay snapshots and
+  # metadata.db (separate from containerd's). The conventional layout places it
+  # under containerd's data dir using the io.containerd.snapshotter.v1.<name>
+  # naming scheme, keeping pv-snapshotter's data in a self-contained subtree.
+  # NOTE: fresh-install only — relocating this on a node that already has
+  # pv-snapshotter snapshots strands the prior snapshots and metadata.db.
+  rootPath: /var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter
   upperDirLabel: true
   syncRemove: false
   slowChown: false
