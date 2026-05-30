@@ -338,6 +338,10 @@ ctr --namespace=k8s.io snapshots \
 
 This is the same operational requirement shared by all containerd proxy snapshotters (stargz-snapshotter, nydus-snapshotter, soci-snapshotter). pv-snapshotter cannot share the default overlayfs `metadata.db` because BoltDB uses an exclusive file lock — only one process may open it for writing at a time.
 
+**Reducing duplicate storage with `--share-overlayfs-lowers` (v0.1.6+):**
+
+When the host's native overlayfs snapshotter already has the image layers (e.g. the image was pulled before pv-snapshotter was introduced), enable `--share-overlayfs-lowers=true` to skip re-unpacking. pv-snapshotter creates lightweight "reference snapshots" whose `fs/` directory is a symlink into the host overlayfs layer directory, then pins those layers with a containerd lease to prevent GC. See [Changelog](#changelog) for operational details and kernel validation requirements.
+
 ---
 
 ## Helm Chart
@@ -621,6 +625,46 @@ branch:
 
 ## Changelog
 
+### v0.1.6 — Dedup (`--share-overlayfs-lowers`) + sandbox upperdir fix (CURRENT RELEASE)
+
+**1. Opportunistic dedup of read-only image layers (`--share-overlayfs-lowers`)**
+
+pv-snapshotter previously re-unpacked image layers into its own `metadata.db` for
+every image, duplicating the host's native overlayfs store. With
+`--share-overlayfs-lowers=true` (opt-in, default false), pv-snapshotter reuses the
+host overlayfs layers opportunistically:
+
+- When `Stat(chainID)` returns not-found locally but the chainID exists in the host
+  overlayfs snapshotter, a "reference snapshot" is created on demand: `Prepare` is
+  called for the chainID, the new snapshot's `fs/` directory is replaced with a
+  **symlink** pointing at the overlayfs layer's real physical directory
+  (`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<N>/fs`),
+  and the snapshot is committed. The kernel accepts this symlink as a lowerdir entry
+  (verified on Linux 6.8).
+- A containerd **lease** (no expiration) is created to pin the overlayfs chainID
+  and its entire parent chain against GC. The lease carries two labels:
+  `pv-snapshotter.io/managed-by=pv-snapshotter` and
+  `pv-snapshotter.io/owner-snapshot=<activeSnapshotKey>`. On `Remove()`, the lease
+  is deleted by querying the `owner-snapshot` label.
+- If unpin fails, `pv_snapshotter_unpin_failures_total{node_name}` is incremented.
+  Alert on `rate(pv_snapshotter_unpin_failures_total[5m]) > 0`. Use
+  `DELETE /dedup/leases/:leaseID` for manual recovery.
+- **Operational API**: `GET /dedup/leases` lists all managed leases (JSON);
+  `DELETE /dedup/leases/:leaseID` removes one.
+- **⚠️ Kernel re-validation required on upgrade**: the symlink-as-lowerdir behavior
+  is a kernel implementation detail, not a documented API. Re-run P0-1 through P0-4
+  on each new kernel version before enabling in production.
+
+Enable via Helm: `--set overlaySnapshotter.shareOverlayfsLowers=true`
+
+**2. Sandbox (pause) container upperdir redirection suppressed**
+
+The resolver now skips upperdir redirection for sandbox (`pause`) containers.
+Previously both the pause container and the workload container received the same
+`upperdirPath`, causing two overlay mounts to share the same `workdir` — which the
+kernel rejects. The pause container writes no business data; skipping it is safe and
+correct. Only workload containers now get the PV-backed upperdir.
+
 ### v0.1.5 — Conventional snapshotter root path + upgrade guidance
 
 - **Default `rootPath` moved** to `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter`,
@@ -669,7 +713,6 @@ pv-snapshotter is **production ready**. Core snapshotter, Helm chart, containerd
 
 ### Future
 
-- [ ] Metrics endpoint (Prometheus) for mount latency and resolution errors
 - [ ] Support for Ceph RBD globalmount staging path (automatic path detection via `sha256(volumeHandle)`)
 - [ ] Multi-arch image builds (arm64)
 

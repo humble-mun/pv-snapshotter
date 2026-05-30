@@ -391,6 +391,8 @@ v1.x has no `/v2` suffix and uses `snapshots/overlay` instead of `plugins/snapsh
 - **Do not** attempt to proxy all snapshot operations to containerd's built-in overlayfs via `client.SnapshotService("overlayfs")` — containerd's metadata wrapper layer transforms keys as `<namespace>/<id>/<key>` before passing them to the underlying snapshotter, so the keys that arrive at pv-snapshotter (already transformed) cannot be forwarded back through the metadata layer without double-transformation causing `not found` on Stat and `already exists` on Prepare.
 - **Do not** write `webhook-annotation-templates` to `daemon.yaml` (the viper config file) — viper's `insensitiviseMap` lowercases all map keys during YAML parsing, corrupting annotation key casing. This flag must always be passed as a CLI argument.
 - **Do not** use the `{{ "{{" }}` Go template escape syntax in `webhook-annotation-templates` flag values — pflag's `stringToString` uses a CSV parser, and bare double-quotes in a CSV field cause a parse error. Instead, pre-populate `templateData.PodUID` with the literal string `"{{.PodUID}}"` so it passes through Layer 2 unchanged.
+- **Do not** pass `leases.WithExpiration(0)` when creating a GC-protection lease — zero expiration means immediate expiry, not "no expiry". Omit the expiration option entirely to create a permanent lease.
+- **Do not** enable `--share-overlayfs-lowers` in production without first running P0-1 through P0-4 validation on the target kernel. The symlink-as-lowerdir behavior is a kernel implementation detail, not a documented API; it must be re-validated on each new kernel version.
 
 ---
 
@@ -489,7 +491,7 @@ The `webhook-annotation-templates` value in `values.yaml` is therefore illustrat
 
 **Note on `var.PVName`:** The default `upperdir-path-template` renders `{{.PVName}}` (a Layer-2 variable) at webhook time, substituting the actual PV name into the path. The companion `var.PVName` annotation is also stamped onto the pod with the rendered PV name, making the value available to pv-snapshotter's own template engine for any custom template that references `{{.PVName}}` at Layer 3. The Layer-2 substitution of `{{.PVName}}` in `upperdir-path-template` itself is intentional and correct — pv-snapshotter does not need to re-resolve the PV name since the webhook has already embedded it literally in the path.
 
-### Done — v0.1.4: GC fix (CURRENT RELEASE)
+### Done — v0.1.4: GC fix
 
 One bug fixed that caused disk pressure in v0.1.3:
 
@@ -513,6 +515,32 @@ unpack is sequential (pv-snapshotter does not advertise `rebase`); for very larg
 images ensure kubelet's `runtimeRequestTimeout` is generous (e.g. 5m).
 
 **⚠️ Do not run v0.1.3 in production** — it ships with the `Cleanup()` bug active.
+
+### Done — v0.1.5: Conventional snapshotter root path
+
+Default `rootPath` moved to `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter`, following the `io.containerd.snapshotter.v1.<name>` convention. pv-snapshotter's own `snapshots/` and `metadata.db` now live in a self-contained subtree. Applies to Helm chart default and Go fallback default. **Fresh-install only** — relocating `rootPath` on a node with existing snapshots strands the prior metadata.db.
+
+### Done — v0.1.6: Dedup (--share-overlayfs-lowers) + sandbox upperdir fix (CURRENT RELEASE)
+
+Two changes:
+
+**1. Opportunistic dedup of read-only image layers (`--share-overlayfs-lowers`)**
+
+pv-snapshotter previously re-unpacked image layers into its own `metadata.db` for every image, duplicating the host's native overlayfs store. With `--share-overlayfs-lowers=true` (opt-in, default false), pv-snapshotter reuses the host overlayfs layers opportunistically:
+
+- **Trigger**: `Stat(chainID)` returns not-found locally but the chainID exists in the host overlayfs snapshotter.
+- **`statWithLazyMaterialise`** (in `dedup.go`): under a per-dedup mutex, creates a "reference snapshot" — calls native `Prepare(chainID, parent)`, then replaces the new snapshot's `fs/` directory with a **symlink** pointing at the overlayfs layer's real physical directory (`/var/lib/containerd/io.containerd.snapshotter.v1.overlayfs/snapshots/<N>/fs`). Commits the snapshot. The symlink is accepted by the kernel as a lowerdir entry (verified on kernel 6.8.0).
+- **GC protection**: `pinLayer` creates a containerd lease (no expiration) with `AddResource{Type:"snapshots/overlayfs", ID:chainID}` and two labels: `pv-snapshotter.io/managed-by=pv-snapshotter`, `pv-snapshotter.io/owner-snapshot=<activeSnapshotKey>`. This pins the overlayfs chainID and its entire parent chain against GC.
+- **`Prepare()` hook**: after each native `Prepare`, if the snapshot key is an active container (not a chainID) and the parent, once unwrapped from the `k8s.io/<seq>/` metadata prefix, is a chainID, `pinLayer` is called. The metadata prefix stripping via `parseSnapshotKey` is critical — raw keys arriving at pv-snapshotter are already wrapped.
+- **Release**: `Remove()` calls `unpinByActiveKey`, which queries leases by the `owner-snapshot` label and deletes them. Failures increment the `pv_snapshotter_unpin_failures_total` counter (node_name label) without blocking Remove.
+- **Operational API**: `GET /dedup/leases` lists all managed leases (JSON); `DELETE /dedup/leases/:leaseID` removes a specific lease (for manual recovery when unpin fails).
+- **Prometheus metrics**: `pv_snapshotter_pinned_snapshots_total{node_name}` gauge; `pv_snapshotter_unpin_failures_total{node_name}` counter — alert on `rate(...[5m]) > 0`.
+- **Key lease gotcha**: `leases.WithExpiration(0)` means immediate expiry. Never pass this option. Omit the expiration option entirely to create a permanent lease.
+- **Re-validate on upgrade**: P0-1 through P0-4 must be re-run on each new kernel version before enabling in production. The symlink-as-lowerdir behavior is a kernel implementation detail, not a documented API.
+
+**2. Sandbox (pause) container upperdir redirection suppressed**
+
+`resolver.go` now skips upperdir redirection for `criKindSandbox` containers. Previously both the pause container and the workload container received the same `upperdirPath`, causing two overlay mounts to share the same `workdir` — which the kernel rejects. The pause container writes no business data; skipping it is safe and correct. Only workload containers (`criKindContainer`) now get the PV-backed upperdir.
 
 ---
 
@@ -717,4 +745,4 @@ ctr --namespace=k8s.io snapshots --snapshotter=pv-snapshotter info <key>
 
 ## One-sentence summary
 
-**The snapshotter does exactly one thing: when a Pod has an upperdir annotation, rewrite the overlay mount options returned to runc so that `upperdir=` and `workdir=` point to `upper/` and `work/` inside the caller-provided path. Everything else is a pass-through to native overlayfs.**
+**The snapshotter does exactly one thing: when a Pod has an upperdir annotation, rewrite the overlay mount options returned to runc so that `upperdir=` and `workdir=` point to `upper/` and `work/` inside the caller-provided path. Everything else is a pass-through to native overlayfs.** With `--share-overlayfs-lowers=true`, image read-only layers already present in the host overlayfs are reused via symlink-backed reference snapshots instead of being re-unpacked — but the upperdir redirection logic itself is unchanged.
