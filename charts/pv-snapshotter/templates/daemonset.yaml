@@ -27,6 +27,7 @@ data:
       mount-options:
 {{ toYaml .Values.overlaySnapshotter.mountOptions | indent 6 }}
       {{- end }}
+    share-overlayfs-lowers: {{ .Values.overlaySnapshotter.shareOverlayfsLowers }}
     {{- if .Values.webhook.enabled }}
     webhook-enabled: true
     webhook-pvc-name-template: {{ .Values.webhook.pvcNameTemplate | quote }}

@@ -34,6 +34,13 @@ overlaySnapshotter:
   # mountOptions is passed verbatim to overlayfs.
   # WARNING: never add "volatile" — it causes upperdir data loss on unclean shutdown.
   mountOptions: []
+  # shareOverlayfsLowers enables the dedup path: when a container image's
+  # read-only layers are already present in the host's native overlayfs
+  # snapshotter, pv-snapshotter creates reference snapshots (with fs/ as a
+  # symlink into the overlayfs layer directory) instead of re-unpacking.
+  # Requires Phase-0 validation (P0-1 through P0-4) to have passed on the
+  # target kernel version before enabling in production.
+  shareOverlayfsLowers: false
 
 # ---------------------------------------------------------------------------
 # containerd config patching (sidecar container: "config")

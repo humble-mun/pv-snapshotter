@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 
+	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
@@ -46,7 +47,8 @@ func newRootCommand() *cobra.Command {
 			logger = logger.WithValues("nodeName", nodeName)
 
 			var sn io.Closer
-			if sn, err = snapshotter.RegisterGRPCService(rootLogger, srv); err != nil {
+			var registerRoute func(*gin.Engine)
+			if sn, registerRoute, err = snapshotter.RegisterGRPCService(rootLogger, nodeName, srv); err != nil {
 				logger.Error(err, "register snapshotter GRPC service failed")
 				return
 			}
@@ -55,6 +57,8 @@ func newRootCommand() *cobra.Command {
 					logger.Error(e, "close snapshotter grpc service failed")
 				}
 			}()
+
+			httpGin.RegisterRoute(registerRoute)
 
 			if webhook.Enabled() {
 				var h *webhook.Handler
