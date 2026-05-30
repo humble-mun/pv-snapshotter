@@ -168,8 +168,22 @@ func (r resolver) resolveAtMountsTime(_ context.Context, key string) (upperdirPa
 	kind := info.Labels[criKindLabel]
 	switch kind {
 	case criKindSandbox:
-		// Sandbox container: extensions carry the PodSandboxConfig directly.
-		upperdirPath, err = r.upperdirFromSandboxContainer(nsCtx, ctrs[0], key)
+		// Sandbox (pause) containers do not need upperdir redirection.
+		// Only workload containers carry business writes; the pause container
+		// writes nothing meaningful to its overlay upperdir.
+		//
+		// More importantly, both the sandbox and the first workload container
+		// belong to the same Pod and therefore share the same annotation
+		// (upperdirPath).  Redirecting both mounts to <upperdirPath>/upper and
+		// <upperdirPath>/work would cause an overlayfs mount conflict: the kernel
+		// requires each overlay mount's workdir to be exclusive — a second mount
+		// using the same workdir is rejected with EBUSY.
+		//
+		// Skipping redirection for the sandbox means its writable layer lives
+		// under the native overlay snapshotter root and is discarded on pod
+		// deletion.  This is fine: pause writes nothing.
+		r.logger.V(4).Info("sandbox container: skipping upperdir redirection", "key", key)
+		return
 
 	case criKindContainer:
 		// Workload container: look up the parent sandbox by SandboxID.
