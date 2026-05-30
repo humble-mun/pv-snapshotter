@@ -6,15 +6,21 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net/http"
 
 	snapshotsv1 "github.com/containerd/containerd/api/services/snapshots/v1"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/spf13/pflag"
 	"github.com/spf13/viper"
 	"google.golang.org/grpc"
+
+	"github.com/humble-mun/chassis/pkg/metrics"
 )
 
 const (
@@ -25,6 +31,13 @@ const (
 	defaultUnixSocketPath = "/var/run/pv-snapshotter/daemon.sock"
 	flagContainerdSocket  = "containerd-socket"
 	flagAnnotationPrefix  = "annotation-prefix"
+
+	// flagShareOverlayfsLowers enables the dedup path: when a container image's
+	// read-only layers are already present in the host's native overlayfs
+	// snapshotter, pv-snapshotter creates reference snapshots (with fs/ as a
+	// symlink into the overlayfs layer directory) instead of re-unpacking.
+	// Disabled by default; enable only after validating P0-5.
+	flagShareOverlayfsLowers = "share-overlayfs-lowers"
 )
 
 // RegisterFlags registers the snapshotter flags with the provided flag set.
@@ -39,6 +52,11 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 			"  <prefix>/upperdir-path          – literal upperdir root path\n"+
 			"  <prefix>/upperdir-path-template – Go template rendered to upperdir root path\n"+
 			"  <prefix>/var.<Name>             – template variable injected into template data")
+	pfs.Bool(flagShareOverlayfsLowers, false,
+		"Enable dedup: reuse overlayfs read-only layers instead of re-unpacking. "+
+			"When set, Stat() lazily creates reference snapshots (fs/ symlinked into "+
+			"the host overlayfs layer directory) for image layers already present in "+
+			"the native overlayfs snapshotter.")
 }
 
 // GetUnixSocketPath returns the configured Unix socket path for the snapshotter gRPC listener.
@@ -48,7 +66,9 @@ func GetUnixSocketPath() string {
 
 // RegisterGRPCService creates the native overlay snapshotter, wires up the containerd resolver,
 // registers the snapshot gRPC service on srv, and returns a Closer that tears down both.
-func RegisterGRPCService(logger logr.Logger, srv *grpc.Server) (closer io.Closer, err error) {
+func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) (
+	closer io.Closer, registerRoute func(*gin.Engine), err error) {
+
 	logger = logger.WithName("snapshotter")
 
 	var closers closerFuncs
@@ -77,6 +97,16 @@ func RegisterGRPCService(logger logr.Logger, srv *grpc.Server) (closer io.Closer
 
 	closer = closers
 
+	ss := snapshotter{logger: logger, Snapshotter: sn, resolver: res}
+
+	// Wire dedupManager when --share-overlayfs-lowers is enabled.
+	if viper.GetBool(flagShareOverlayfsLowers) {
+		ss.dedup = newDedupManager(logger, nodeName, res.client, sn)
+		logger.Info("dedup path enabled (--share-overlayfs-lowers=true)")
+	}
+
+	registerRoute = ss.registerRoute
+
 	// Wrap sn in the appropriate type depending on whether the underlying
 	// overlay snapshotter implements snapshots.Cleaner (deferred directory
 	// removal after Remove()).  The type assertion is performed once here at
@@ -84,12 +114,12 @@ func RegisterGRPCService(logger logr.Logger, srv *grpc.Server) (closer io.Closer
 	// Cleanup RPC without a per-call runtime assertion inside Cleanup().
 	var wrapped snapshots.Snapshotter
 	if c, ok := sn.(snapshots.Cleaner); ok {
-		wrapped = cleanerSnapshotter{
-			snapshotter: snapshotter{logger: logger, Snapshotter: sn, resolver: res},
+		wrapped = &cleanerSnapshotter{
+			snapshotter: ss,
 			cleaner:     c,
 		}
 	} else {
-		wrapped = &snapshotter{logger: logger, Snapshotter: sn, resolver: res}
+		wrapped = &ss
 	}
 
 	snapshotService := snapshotservice.FromSnapshotter(wrapped)
@@ -116,19 +146,128 @@ func (cs closerFuncs) Close() error {
 	return errors.Join(errs...)
 }
 
+var (
+	// pinnedSnapshotsTotal tracks the number of overlayfs snapshots currently
+	// pinned by a pv-snapshotter-managed lease (i.e., referenced containers
+	// whose image layers are kept alive via the dedup path).
+	// Label: node_name — identifies the node where the lease was created,
+	// making it possible to correlate alerts to a specific node.
+	pinnedSnapshotsTotal = metrics.Register(func(registry promauto.Factory) *prometheus.GaugeVec {
+		return registry.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pv_snapshotter_pinned_snapshots_total",
+			Help: "Number of overlayfs snapshots currently held by a pv-snapshotter dedup lease.",
+		}, []string{"node_name"})
+	})
+
+	// unpinFailuresTotal counts the number of times unpinByActiveKey failed to
+	// delete a dedup lease during Remove().  A non-zero rate indicates dangling
+	// leases that require manual cleanup via DELETE /dedup/leases/:leaseID.
+	// Alert rule: rate(pv_snapshotter_unpin_failures_total[5m]) > 0
+	unpinFailuresTotal = metrics.Register(func(registry promauto.Factory) *prometheus.CounterVec {
+		return registry.NewCounterVec(prometheus.CounterOpts{
+			Name: "pv_snapshotter_unpin_failures_total",
+			Help: "Total number of failed dedup lease deletions during snapshot Remove. " +
+				"Non-zero values indicate dangling leases requiring manual cleanup.",
+		}, []string{"node_name"})
+	})
+)
+
 type snapshotter struct {
 	logger   logr.Logger
 	resolver *resolver
+	// dedup is non-nil only when --share-overlayfs-lowers is enabled.
+	dedup *dedupManager
 	snapshots.Snapshotter
+}
+
+func (sn snapshotter) registerRoute(mux *gin.Engine) {
+	// Dedup lease management endpoints.
+	// GET    /dedup/leases        – list all pv-snapshotter-managed leases
+	// DELETE /dedup/leases/:id   – force-delete a specific lease (for dangling-lease recovery)
+	mux.GET("/dedup/leases", sn.handleListLeases)
+	mux.DELETE("/dedup/leases/:leaseID", sn.handleDeleteLease)
+}
+
+// handleListLeases lists all leases owned by pv-snapshotter's dedup path.
+// Intended for operational visibility and dangling-lease detection.
+//
+// Response (200 OK):
+//
+//	{ "leases": [ { "id": "...", "createdAt": "...", "labels": {...} }, ... ] }
+//
+// Returns 501 when --share-overlayfs-lowers is disabled.
+func (sn snapshotter) handleListLeases(ctx *gin.Context) {
+	if sn.dedup == nil {
+		ctx.JSON(http.StatusNotImplemented, gin.H{"error": "dedup not enabled (--share-overlayfs-lowers=false)"})
+		return
+	}
+	all, err := sn.dedup.listManagedLeases(ctx, "k8s.io")
+	if err != nil {
+		sn.logger.Error(err, "listing dedup leases")
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	type leaseEntry struct {
+		ID        string            `json:"id"`
+		CreatedAt string            `json:"createdAt"`
+		Labels    map[string]string `json:"labels,omitempty"`
+	}
+	out := make([]leaseEntry, 0, len(all))
+	for _, l := range all {
+		out = append(out, leaseEntry{
+			ID:        l.ID,
+			CreatedAt: l.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			Labels:    l.Labels,
+		})
+	}
+	ctx.JSON(http.StatusOK, gin.H{"leases": out})
+}
+
+// handleDeleteLease force-deletes the lease identified by :leaseID.
+// Use this to recover from a dangling lease when the automatic unpin in
+// Remove() was skipped due to a bug or crash.
+//
+// Response: 204 No Content on success, 404 when not found, 500 on error.
+func (sn snapshotter) handleDeleteLease(ctx *gin.Context) {
+	if sn.dedup == nil {
+		ctx.JSON(http.StatusNotImplemented, gin.H{"error": "dedup not enabled (--share-overlayfs-lowers=false)"})
+		return
+	}
+	leaseID := ctx.Param("leaseID")
+	if leaseID == "" {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": "leaseID is required"})
+		return
+	}
+	if err := sn.dedup.deleteLease(ctx, "k8s.io", leaseID); err != nil {
+		sn.logger.Error(err, "deleting dedup lease via API", "leaseID", leaseID)
+		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	ctx.Status(http.StatusNoContent)
 }
 
 func (sn snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
 	sn.logger.V(4).Info("Stat called", "key", key)
-	if info, err = sn.Snapshotter.Stat(ctx, key); err != nil {
-		sn.logger.Error(err, "failed to stat", "key", key)
-	} else {
+
+	info, err = sn.Snapshotter.Stat(ctx, key)
+	if err == nil {
 		sn.logger.V(4).Info("Stat completed", "key", key, "labels", info.Labels)
+		return
 	}
+
+	// Dedup path: when the local snapshotter reports not-found and dedup is
+	// enabled, check whether the key is an image-layer chainID present in the
+	// host overlayfs.  If so, materialise a reference snapshot so the CRI
+	// unpacker skips re-unpacking.
+	if sn.dedup != nil {
+		info, err = sn.dedup.statWithLazyMaterialise(ctx, key, sn.Snapshotter)
+		if err == nil {
+			sn.logger.V(4).Info("Stat resolved via dedup reference", "key", key)
+			return
+		}
+	}
+
+	sn.logger.Error(err, "failed to stat", "key", key)
 	return
 }
 
@@ -199,6 +338,35 @@ func (sn snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	} else {
 		sn.logger.V(4).Info("Prepare completed", "key", key)
 	}
+
+	// Dedup path: when a container's active snapshot is created on top of a
+	// dedup-materialised chainID, pin the overlayfs layer so GC cannot reclaim
+	// it while the container is running.
+	//
+	// Conditions:
+	//   - dedup is enabled
+	//   - key is a container active snapshot (k8s.io/N/<containerID> format,
+	//     not a sha256 chainID — image-layer Prepare calls have key==chainID)
+	//   - parent's third segment is a chainID — the metadata layer wraps the
+	//     parent as "<ns>/<seq>/<chainID>", so isChainID must be checked against
+	//     the parsed containerID field, not the raw parent string
+	//
+	// pinLayer is intentionally called even when Prepare itself returned an
+	// error: the error surface is independent and the caller (CRI) will handle
+	// the Prepare failure.  Pin failure is logged but non-fatal.
+	if sn.dedup != nil {
+		ns, activeID, nsOk := parseSnapshotKey(key)
+		if !nsOk {
+			ns = "k8s.io"
+		}
+		_, parentChainID, parentOk := parseSnapshotKey(parent)
+		if nsOk && !isChainID(activeID) && parentOk && isChainID(parentChainID) {
+			if _, pinErr := sn.dedup.pinLayer(ctx, ns, parentChainID, key); pinErr != nil {
+				sn.logger.Error(pinErr, "failed to pin dedup layer; GC protection missing for this container",
+					"key", key, "parent", parent, "chainID", parentChainID)
+			}
+		}
+	}
 	return
 }
 
@@ -236,6 +404,15 @@ func (sn snapshotter) Remove(ctx context.Context, key string) (err error) {
 		sn.logger.Error(err, "failed to remove", "key", key)
 	} else {
 		sn.logger.V(4).Info("Remove completed", "key", key)
+	}
+
+	// Dedup path: release the overlayfs layer lease pinned for this active
+	// snapshot, if any.  Errors are logged inside unpinByActiveKey and never
+	// surfaced — an unpin failure must not block snapshot removal.
+	if sn.dedup != nil {
+		if ns, _, ok := parseSnapshotKey(key); ok {
+			sn.dedup.unpinByActiveKey(ctx, ns, key)
+		}
 	}
 	return
 }
