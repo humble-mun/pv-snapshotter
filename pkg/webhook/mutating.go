@@ -506,10 +506,7 @@ func (h *Handler) waitBound(
 
 	deadline := time.Now().Add(h.boundTimeout)
 
-	for {
-		if pvc.Status.Phase == corev1.ClaimBound {
-			break
-		}
+	for pvc.Status.Phase != corev1.ClaimBound {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return "", "", fmt.Errorf(

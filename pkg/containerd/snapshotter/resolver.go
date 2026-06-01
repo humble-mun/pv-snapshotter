@@ -45,6 +45,16 @@ const (
 
 	// defaultContainerdSocket is the default containerd gRPC socket path.
 	defaultContainerdSocket = "/run/containerd/containerd.sock"
+
+	// containerdNamespaceK8s is the containerd namespace used by the CRI
+	// plugin for all Kubernetes workloads.
+	containerdNamespaceK8s = "k8s.io"
+
+	// reservedAnnotationPrefixKubernetes and reservedAnnotationPrefixK8s are
+	// the two Kubernetes-reserved DNS subdomains that must not be used as the
+	// pv-snapshotter annotation prefix.
+	reservedAnnotationPrefixKubernetes = "kubernetes.io"
+	reservedAnnotationPrefixK8s        = "k8s.io"
 )
 
 // sandboxMetadata mirrors the versioned wrapper used by containerd CRI:
@@ -96,25 +106,19 @@ func validateAnnotationPrefix(prefix string) error {
 		return fmt.Errorf("annotation prefix %q is not a valid DNS subdomain: %s",
 			prefix, strings.Join(errs, "; "))
 	}
-	if prefix == "kubernetes.io" || prefix == "k8s.io" ||
-		strings.HasSuffix(prefix, ".kubernetes.io") || strings.HasSuffix(prefix, ".k8s.io") {
+	if prefix == reservedAnnotationPrefixKubernetes || prefix == reservedAnnotationPrefixK8s ||
+		strings.HasSuffix(prefix, "."+reservedAnnotationPrefixKubernetes) || strings.HasSuffix(prefix, "."+reservedAnnotationPrefixK8s) {
 		return fmt.Errorf("annotation prefix %q uses a reserved Kubernetes domain", prefix)
 	}
 	return nil
 }
 
-func newResolver(logger logr.Logger) (*resolver, error) {
+func newResolver(logger logr.Logger, client *containerd.Client) (*resolver, error) {
 	prefix := viper.GetString(flagAnnotationPrefix)
 	if err := validateAnnotationPrefix(prefix); err != nil {
 		return nil, fmt.Errorf("invalid --annotation-prefix: %w", err)
 	}
 	base := prefix + "/"
-
-	socketPath := viper.GetString(flagContainerdSocket)
-	client, err := containerd.New(socketPath)
-	if err != nil {
-		return nil, fmt.Errorf("connecting to containerd socket %q: %w", socketPath, err)
-	}
 
 	return &resolver{
 		client:       client,
@@ -123,10 +127,6 @@ func newResolver(logger logr.Logger) (*resolver, error) {
 		keyTemplate:  base + annotationSuffixUpperdirPathTemplate,
 		keyVarPrefix: base + annotationSuffixVarSubPrefix,
 	}, nil
-}
-
-func (r resolver) Close() error {
-	return r.client.Close()
 }
 
 // resolveAtMountsTime extracts the upperdir-path annotation for the container

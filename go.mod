@@ -8,7 +8,7 @@ require (
 	github.com/containerd/typeurl/v2 v2.2.3
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-logr/logr v1.4.3
-	github.com/humble-mun/chassis v0.1.2
+	github.com/humble-mun/chassis v0.1.3
 	github.com/pelletier/go-toml/v2 v2.3.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/spf13/cobra v1.10.2

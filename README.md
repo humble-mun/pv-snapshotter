@@ -625,7 +625,51 @@ branch:
 
 ## Changelog
 
-### v0.1.6 — Dedup (`--share-overlayfs-lowers`) + sandbox upperdir fix (CURRENT RELEASE)
+### v0.1.7 — Orphan lease GC, scrape hook, string constants (CURRENT RELEASE)
+
+**1. Orphan lease GC (`countOrphanLeases` / `gcOrphanLeases` in `dedup.go`)**
+
+When `Remove()` fails to unpin a lease (e.g. pv-snapshotter restarted mid-flight), the
+lease becomes "orphaned" — its owning active snapshot no longer exists in `localSn` but
+the lease persists, keeping the overlayfs chainID pinned against GC. Two new methods on
+`dedupManager` address this:
+
+- `countOrphanLeases(ctx, ns)` — lists all leases labeled
+  `pv-snapshotter.io/managed-by=pv-snapshotter`, checks each `owner-snapshot` label
+  value against `localSn.Stat()`, and returns the count of orphans. Called by the scrape
+  hook to refresh `pv_snapshotter_orphan_leases_total`.
+- `gcOrphanLeases(ctx, ns)` — same traversal; deletes each orphan lease, calls
+  `pinnedSnapshotsTotal.Dec()` per deletion, and returns the count deleted. Best-effort:
+  logs errors and continues the sweep on failure.
+
+**2. New Prometheus metric + `RegisterScrapeHook` implementation**
+
+- `pv_snapshotter_orphan_leases_total{node_name}` GaugeVec added. Refreshed on every
+  `/metrics` scrape.
+- `RegisterScrapeHook(ctx context.Context)` was previously a TODO stub; it is now
+  implemented: calls `countOrphanLeases` and updates the gauge. Wired in `main.go` via
+  `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.3 API).
+- `POST /dedup/leases/gc` handler added: returns `{"deleted": N}` after calling
+  `gcOrphanLeases`; returns 501 if dedup is not enabled.
+
+**3. String constants refactor**
+
+All bare `"k8s.io"` and `"kubernetes.io"` string literals in the snapshotter package
+replaced with named constants defined in `resolver.go`:
+
+| Constant | Value |
+|----------|-------|
+| `containerdNamespaceK8s` | `"k8s.io"` |
+| `reservedAnnotationPrefixKubernetes` | `"kubernetes.io"` |
+| `reservedAnnotationPrefixK8s` | `"k8s.io"` |
+
+Affected files: `resolver.go` (constant definitions + `validateAnnotationPrefix`),
+`service.go` (5 call sites), `dedup.go` (1 fallback namespace assignment). Import paths
+and template string fragments (`kubernetes.io~csi`) are intentionally left unchanged.
+
+---
+
+### v0.1.6 — Dedup (`--share-overlayfs-lowers`) + sandbox upperdir fix
 
 **1. Opportunistic dedup of read-only image layers (`--share-overlayfs-lowers`)**
 
@@ -650,7 +694,12 @@ host overlayfs layers opportunistically:
   Alert on `rate(pv_snapshotter_unpin_failures_total[5m]) > 0`. Use
   `DELETE /dedup/leases/:leaseID` for manual recovery.
 - **Operational API**: `GET /dedup/leases` lists all managed leases (JSON);
-  `DELETE /dedup/leases/:leaseID` removes one.
+  `DELETE /dedup/leases/:leaseID` removes one;
+  `POST /dedup/leases/gc` triggers an orphan lease GC sweep (returns `{"deleted": N}`,
+  see v0.1.7).
+- **Prometheus metrics**: `pv_snapshotter_pinned_snapshots_total{node_name}` gauge;
+  `pv_snapshotter_unpin_failures_total{node_name}` counter;
+  `pv_snapshotter_orphan_leases_total{node_name}` gauge refreshed on scrape (see v0.1.7).
 - **⚠️ Kernel re-validation required on upgrade**: the symlink-as-lowerdir behavior
   is a kernel implementation detail, not a documented API. Re-run P0-1 through P0-4
   on each new kernel version before enabling in production.

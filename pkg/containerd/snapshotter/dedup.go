@@ -90,7 +90,7 @@ func newDedupManager(logger logr.Logger, nodeName string, client *containerd.Cli
 // mount options, and then removes the View.
 //
 // Returns ("", nil) when chainID is not present in overlayfs.
-func (m *dedupManager) overlayfsLayerPath(ctx context.Context, ns, chainID string) (path string, err error) {
+func (m *dedupManager) overlayfsLayerPath(_ context.Context, ns, chainID string) (path string, err error) {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 
 	ovlSvc := m.containerdClient.SnapshotService(overlayfsSnapshotterName)
@@ -254,7 +254,7 @@ func (m *dedupManager) statWithLazyMaterialise(
 	// Namespace comes from the context already set by the CRI caller.
 	ns, _ := namespaces.Namespace(ctx)
 	if ns == "" {
-		ns = "k8s.io"
+		ns = containerdNamespaceK8s
 	}
 
 	// Resolve the physical overlayfs layer directory.
@@ -292,7 +292,7 @@ func (m *dedupManager) statWithLazyMaterialise(
 
 // resolveParentChainID returns the parent chainID of chainID from the overlayfs
 // snapshotter.  Returns ("", nil) for root layers (no parent).
-func (m *dedupManager) resolveParentChainID(ctx context.Context, ns, chainID string) (string, error) {
+func (m *dedupManager) resolveParentChainID(_ context.Context, ns, chainID string) (string, error) {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	info, err := m.containerdClient.SnapshotService(overlayfsSnapshotterName).Stat(nsCtx, chainID)
 	if err != nil {
@@ -313,14 +313,12 @@ func isChainID(s string) bool {
 		return false
 	}
 	for _, c := range hex {
-		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false
 		}
 	}
 	return true
 }
-
-
 
 // pinLayer creates a permanent containerd lease that pins chainID in the
 // overlayfs snapshotter, preventing GC from reclaiming it or its ancestors
@@ -334,7 +332,7 @@ func isChainID(s string) bool {
 // entire ancestor chain transitively.
 //
 // Returns the created lease so the caller can store it for later release.
-func (m *dedupManager) pinLayer(ctx context.Context, ns, chainID, activeSnapshotKey string) (leases.Lease, error) {
+func (m *dedupManager) pinLayer(_ context.Context, ns, chainID, activeSnapshotKey string) (leases.Lease, error) {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	leaseSvc := m.containerdClient.LeasesService()
 
@@ -376,7 +374,7 @@ func (m *dedupManager) pinLayer(ctx context.Context, ns, chainID, activeSnapshot
 // Errors are logged but do not affect the return value — a failed unpin must
 // not prevent the snapshot Remove from completing.  Dangling leases can be
 // cleaned up manually via DELETE /dedup/leases/:leaseID.
-func (m *dedupManager) unpinByActiveKey(ctx context.Context, ns, activeSnapshotKey string) {
+func (m *dedupManager) unpinByActiveKey(_ context.Context, ns, activeSnapshotKey string) {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	leaseSvc := m.containerdClient.LeasesService()
 
@@ -410,7 +408,7 @@ func (m *dedupManager) unpinByActiveKey(ctx context.Context, ns, activeSnapshotK
 // ListManagedLeases returns all leases created by pv-snapshotter's dedup path
 // across all namespaces.  It is called by the HTTP handler for
 // GET /dedup/leases.
-func (m *dedupManager) listManagedLeases(ctx context.Context, ns string) ([]leases.Lease, error) {
+func (m *dedupManager) listManagedLeases(_ context.Context, ns string) ([]leases.Lease, error) {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	filter := fmt.Sprintf("labels.%q==%q", leaseLabelManagedBy, leaseLabelManagedByValue)
 	return m.containerdClient.LeasesService().List(nsCtx, filter)
@@ -418,11 +416,84 @@ func (m *dedupManager) listManagedLeases(ctx context.Context, ns string) ([]leas
 
 // DeleteLease deletes a specific lease by ID.  It is called by the HTTP
 // handler for DELETE /dedup/leases/:leaseID.
-func (m *dedupManager) deleteLease(ctx context.Context, ns, leaseID string) error {
+func (m *dedupManager) deleteLease(_ context.Context, ns, leaseID string) error {
 	nsCtx := namespaces.WithNamespace(context.Background(), ns)
 	if err := m.containerdClient.LeasesService().Delete(nsCtx, leases.Lease{ID: leaseID}); err != nil {
 		return fmt.Errorf("deleting lease %s: %w", leaseID, err)
 	}
 	pinnedSnapshotsTotal.With(prometheus.Labels{"node_name": m.nodeName}).Dec()
 	return nil
+}
+
+// -------------------------------------------------------------------------
+// Orphan-lease detection and GC
+// -------------------------------------------------------------------------
+
+// countOrphanLeases counts leases whose owning active snapshot no longer
+// exists in the local snapshotter.  It is called from the scrape hook so
+// that the pv_snapshotter_orphan_leases_total gauge reflects the current
+// number of dangling leases at every Prometheus scrape.
+//
+// A lease is considered orphaned when:
+//   - it carries the leaseLabelOwnerKey label (i.e. it was created by
+//     pinLayer), AND
+//   - Stat(ownerSnapshotKey) returns not-found on the local snapshotter.
+func (m *dedupManager) countOrphanLeases(ctx context.Context, ns string) int {
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	filter := fmt.Sprintf("labels.%q==%q", leaseLabelManagedBy, leaseLabelManagedByValue)
+	all, err := m.containerdClient.LeasesService().List(nsCtx, filter)
+	if err != nil {
+		m.logger.Error(err, "listing managed leases for orphan count")
+		return 0
+	}
+
+	count := 0
+	for _, l := range all {
+		ownerKey := l.Labels[leaseLabelOwnerKey]
+		if ownerKey == "" {
+			continue
+		}
+		if _, statErr := m.localSn.Stat(ctx, ownerKey); statErr != nil {
+			count++
+		}
+	}
+	return count
+}
+
+// gcOrphanLeases deletes all leases whose owning active snapshot no longer
+// exists.  It is called from the POST /dedup/leases/gc HTTP handler.
+//
+// Returns the number of leases that were successfully deleted.
+// Errors for individual lease deletions are logged but do not abort the
+// sweep — best-effort cleanup is preferred over partial failure.
+func (m *dedupManager) gcOrphanLeases(ctx context.Context, ns string) (deleted int) {
+	nsCtx := namespaces.WithNamespace(context.Background(), ns)
+	leaseSvc := m.containerdClient.LeasesService()
+	filter := fmt.Sprintf("labels.%q==%q", leaseLabelManagedBy, leaseLabelManagedByValue)
+	all, err := leaseSvc.List(nsCtx, filter)
+	if err != nil {
+		m.logger.Error(err, "listing managed leases for GC sweep")
+		return
+	}
+
+	for _, l := range all {
+		ownerKey := l.Labels[leaseLabelOwnerKey]
+		if ownerKey == "" {
+			continue
+		}
+		if _, statErr := m.localSn.Stat(ctx, ownerKey); statErr == nil {
+			// Active snapshot still exists — not orphaned.
+			continue
+		}
+		if delErr := leaseSvc.Delete(nsCtx, l); delErr != nil {
+			m.logger.Error(delErr, "GC: failed to delete orphan lease",
+				"leaseID", l.ID, "ownerKey", ownerKey)
+			continue
+		}
+		m.logger.V(4).Info("GC: deleted orphan lease",
+			"leaseID", l.ID, "ownerKey", ownerKey)
+		pinnedSnapshotsTotal.With(prometheus.Labels{"node_name": m.nodeName}).Dec()
+		deleted++
+	}
+	return
 }

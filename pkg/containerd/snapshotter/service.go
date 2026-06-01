@@ -4,11 +4,11 @@ package snapshotter
 
 import (
 	"context"
-	"errors"
 	"io"
 	"net/http"
 
 	snapshotsv1 "github.com/containerd/containerd/api/services/snapshots/v1"
+	containerd "github.com/containerd/containerd/v2/client"
 	"github.com/containerd/containerd/v2/contrib/snapshotservice"
 	"github.com/containerd/containerd/v2/core/mount"
 	"github.com/containerd/containerd/v2/core/snapshots"
@@ -64,18 +64,29 @@ func GetUnixSocketPath() string {
 	return viper.GetString(flagUnixSocketPath)
 }
 
+// Service is the lifecycle interface returned by RegisterGRPCService.
+// It exposes the Prometheus scrape hook, the HTTP route registrar, and
+// a Close method that tears down the underlying overlay snapshotter and
+// the containerd client connection.
+type Service interface {
+	io.Closer
+	RegisterScrapeHook(context.Context)
+	RegisterRoute(*gin.Engine)
+}
+
 // RegisterGRPCService creates the native overlay snapshotter, wires up the containerd resolver,
 // registers the snapshot gRPC service on srv, and returns a Closer that tears down both.
-func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) (
-	closer io.Closer, registerRoute func(*gin.Engine), err error) {
-
+func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) (svc Service, err error) {
 	logger = logger.WithName("snapshotter")
 
-	var closers closerFuncs
+	closers := make(map[string]io.Closer)
 	defer func() {
-		if err != nil {
-			if closeErr := closers.Close(); closeErr != nil {
-				logger.Error(closeErr, "failed to close resources during initialization failure")
+		if err == nil {
+			return
+		}
+		for name, closer := range closers {
+			if e := closer.Close(); e != nil {
+				logger.Error(err, "close failed", "name", name)
 			}
 		}
 	}()
@@ -85,27 +96,31 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 		logger.Error(err, "failed to create overlay snapshotter")
 		return
 	}
-	closers = append(closers, sn.Close)
+	closers["snapshotter"] = sn
 
 	socketPath := viper.GetString(flagContainerdSocket)
-	res, err := newResolver(logger)
-	if err != nil {
+	var client *containerd.Client
+	if client, err = containerd.New(socketPath); err != nil {
+		logger.Error(err, "failed to create containerd client", "socketPath", socketPath)
+		return
+	}
+	closers["containerd"] = client
+
+	var res *resolver
+	if res, err = newResolver(logger, client); err != nil {
 		logger.Error(err, "failed to create containerd resolver", "socket", socketPath)
 		return
 	}
-	closers = append(closers, res.Close)
 
-	closer = closers
-
-	ss := snapshotter{logger: logger, Snapshotter: sn, resolver: res}
-
-	// Wire dedupManager when --share-overlayfs-lowers is enabled.
-	if viper.GetBool(flagShareOverlayfsLowers) {
-		ss.dedup = newDedupManager(logger, nodeName, res.client, sn)
+	var dedup *dedupManager
+	if enabled := viper.GetBool(flagShareOverlayfsLowers); enabled {
 		logger.Info("dedup path enabled (--share-overlayfs-lowers=true)")
+		dedup = newDedupManager(logger, nodeName, res.client, sn)
 	}
 
-	registerRoute = ss.registerRoute
+	ss := snapshotter{logger: logger, Snapshotter: sn, client: client, resolver: res, dedup: dedup}
+
+	svc = ss
 
 	// Wrap sn in the appropriate type depending on whether the underlying
 	// overlay snapshotter implements snapshots.Cleaner (deferred directory
@@ -125,25 +140,6 @@ func RegisterGRPCService(logger logr.Logger, nodeName string, srv *grpc.Server) 
 	snapshotService := snapshotservice.FromSnapshotter(wrapped)
 	snapshotsv1.RegisterSnapshotsServer(srv, snapshotService)
 	return
-}
-
-// closerFunc is a function that implements io.Closer.
-type closerFunc func() error
-
-func (f closerFunc) Close() error { return f() }
-
-// closerFuncs is a slice of closerFunc that itself implements io.Closer.
-// Close calls each element in order and returns the first non-nil error.
-type closerFuncs []closerFunc
-
-func (cs closerFuncs) Close() error {
-	var errs []error
-	for _, c := range cs {
-		if err := c(); err != nil {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }
 
 var (
@@ -170,6 +166,18 @@ var (
 				"Non-zero values indicate dangling leases requiring manual cleanup.",
 		}, []string{"node_name"})
 	})
+
+	// orphanLeasesTotal is the current number of pv-snapshotter dedup leases
+	// whose owning active snapshot no longer exists in the local snapshotter.
+	// Refreshed on every Prometheus scrape via the scrape hook.
+	// Alert rule: pv_snapshotter_orphan_leases_total > 0
+	orphanLeasesTotal = metrics.Register(func(registry promauto.Factory) *prometheus.GaugeVec {
+		return registry.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "pv_snapshotter_orphan_leases_total",
+			Help: "Number of pv-snapshotter dedup leases whose owning active snapshot no " +
+				"longer exists. Refreshed on scrape. Non-zero values indicate GC is needed.",
+		}, []string{"node_name"})
+	})
 )
 
 type snapshotter struct {
@@ -178,14 +186,25 @@ type snapshotter struct {
 	// dedup is non-nil only when --share-overlayfs-lowers is enabled.
 	dedup *dedupManager
 	snapshots.Snapshotter
+	client *containerd.Client
 }
 
-func (sn snapshotter) registerRoute(mux *gin.Engine) {
+func (sn snapshotter) RegisterScrapeHook(ctx context.Context) {
+	if sn.dedup == nil {
+		return
+	}
+	count := sn.dedup.countOrphanLeases(ctx, containerdNamespaceK8s)
+	orphanLeasesTotal.With(prometheus.Labels{"node_name": sn.dedup.nodeName}).Set(float64(count))
+}
+
+func (sn snapshotter) RegisterRoute(mux *gin.Engine) {
 	// Dedup lease management endpoints.
 	// GET    /dedup/leases        – list all pv-snapshotter-managed leases
 	// DELETE /dedup/leases/:id   – force-delete a specific lease (for dangling-lease recovery)
+	// POST   /dedup/leases/gc    – delete all orphan leases (owner snapshot no longer exists)
 	mux.GET("/dedup/leases", sn.handleListLeases)
 	mux.DELETE("/dedup/leases/:leaseID", sn.handleDeleteLease)
+	mux.POST("/dedup/leases/gc", sn.handleGCLeases)
 }
 
 // handleListLeases lists all leases owned by pv-snapshotter's dedup path.
@@ -201,7 +220,7 @@ func (sn snapshotter) handleListLeases(ctx *gin.Context) {
 		ctx.JSON(http.StatusNotImplemented, gin.H{"error": "dedup not enabled (--share-overlayfs-lowers=false)"})
 		return
 	}
-	all, err := sn.dedup.listManagedLeases(ctx, "k8s.io")
+	all, err := sn.dedup.listManagedLeases(ctx, containerdNamespaceK8s)
 	if err != nil {
 		sn.logger.Error(err, "listing dedup leases")
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -238,12 +257,31 @@ func (sn snapshotter) handleDeleteLease(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": "leaseID is required"})
 		return
 	}
-	if err := sn.dedup.deleteLease(ctx, "k8s.io", leaseID); err != nil {
+	if err := sn.dedup.deleteLease(ctx, containerdNamespaceK8s, leaseID); err != nil {
 		sn.logger.Error(err, "deleting dedup lease via API", "leaseID", leaseID)
 		ctx.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	ctx.Status(http.StatusNoContent)
+}
+
+// handleGCLeases deletes all leases whose owning active snapshot no longer
+// exists in the local snapshotter (orphan leases).  It is the trigger for
+// the startup-time audit described in the architecture docs.
+//
+// Response (200 OK):
+//
+//	{ "deleted": <count> }
+//
+// Returns 501 when --share-overlayfs-lowers is disabled.
+func (sn snapshotter) handleGCLeases(ctx *gin.Context) {
+	if sn.dedup == nil {
+		ctx.JSON(http.StatusNotImplemented, gin.H{"error": "dedup not enabled (--share-overlayfs-lowers=false)"})
+		return
+	}
+	deleted := sn.dedup.gcOrphanLeases(ctx, containerdNamespaceK8s)
+	sn.logger.Info("GC sweep completed", "deletedLeases", deleted)
+	ctx.JSON(http.StatusOK, gin.H{"deleted": deleted})
 }
 
 func (sn snapshotter) Stat(ctx context.Context, key string) (info snapshots.Info, err error) {
@@ -357,7 +395,7 @@ func (sn snapshotter) Prepare(ctx context.Context, key, parent string, opts ...s
 	if sn.dedup != nil {
 		ns, activeID, nsOk := parseSnapshotKey(key)
 		if !nsOk {
-			ns = "k8s.io"
+			ns = containerdNamespaceK8s
 		}
 		_, parentChainID, parentOk := parseSnapshotKey(parent)
 		if nsOk && !isChainID(activeID) && parentOk && isChainID(parentChainID) {
@@ -429,6 +467,9 @@ func (sn snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 
 func (sn snapshotter) Close() (err error) {
 	sn.logger.V(4).Info("Close called")
+	if err = sn.client.Close(); err != nil {
+		sn.logger.Error(err, "failed to close containerd client")
+	}
 	if err = sn.Snapshotter.Close(); err != nil {
 		sn.logger.Error(err, "failed to close")
 	} else {

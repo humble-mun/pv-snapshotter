@@ -520,7 +520,7 @@ images ensure kubelet's `runtimeRequestTimeout` is generous (e.g. 5m).
 
 Default `rootPath` moved to `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter`, following the `io.containerd.snapshotter.v1.<name>` convention. pv-snapshotter's own `snapshots/` and `metadata.db` now live in a self-contained subtree. Applies to Helm chart default and Go fallback default. **Fresh-install only** — relocating `rootPath` on a node with existing snapshots strands the prior metadata.db.
 
-### Done — v0.1.6: Dedup (--share-overlayfs-lowers) + sandbox upperdir fix (CURRENT RELEASE)
+### Done — v0.1.6: Dedup (--share-overlayfs-lowers) + sandbox upperdir fix
 
 Two changes:
 
@@ -533,14 +533,43 @@ pv-snapshotter previously re-unpacked image layers into its own `metadata.db` fo
 - **GC protection**: `pinLayer` creates a containerd lease (no expiration) with `AddResource{Type:"snapshots/overlayfs", ID:chainID}` and two labels: `pv-snapshotter.io/managed-by=pv-snapshotter`, `pv-snapshotter.io/owner-snapshot=<activeSnapshotKey>`. This pins the overlayfs chainID and its entire parent chain against GC.
 - **`Prepare()` hook**: after each native `Prepare`, if the snapshot key is an active container (not a chainID) and the parent, once unwrapped from the `k8s.io/<seq>/` metadata prefix, is a chainID, `pinLayer` is called. The metadata prefix stripping via `parseSnapshotKey` is critical — raw keys arriving at pv-snapshotter are already wrapped.
 - **Release**: `Remove()` calls `unpinByActiveKey`, which queries leases by the `owner-snapshot` label and deletes them. Failures increment the `pv_snapshotter_unpin_failures_total` counter (node_name label) without blocking Remove.
-- **Operational API**: `GET /dedup/leases` lists all managed leases (JSON); `DELETE /dedup/leases/:leaseID` removes a specific lease (for manual recovery when unpin fails).
-- **Prometheus metrics**: `pv_snapshotter_pinned_snapshots_total{node_name}` gauge; `pv_snapshotter_unpin_failures_total{node_name}` counter — alert on `rate(...[5m]) > 0`.
+- **Operational API**: `GET /dedup/leases` lists all managed leases (JSON); `DELETE /dedup/leases/:leaseID` removes a specific lease (for manual recovery when unpin fails); `POST /dedup/leases/gc` triggers a GC sweep (returns `{"deleted": N}`, see v0.1.7).
+- **Prometheus metrics**: `pv_snapshotter_pinned_snapshots_total{node_name}` gauge; `pv_snapshotter_unpin_failures_total{node_name}` counter; `pv_snapshotter_orphan_leases_total{node_name}` gauge (refreshed on scrape, see v0.1.7) — alert on `rate(...[5m]) > 0`.
 - **Key lease gotcha**: `leases.WithExpiration(0)` means immediate expiry. Never pass this option. Omit the expiration option entirely to create a permanent lease.
 - **Re-validate on upgrade**: P0-1 through P0-4 must be re-run on each new kernel version before enabling in production. The symlink-as-lowerdir behavior is a kernel implementation detail, not a documented API.
 
 **2. Sandbox (pause) container upperdir redirection suppressed**
 
 `resolver.go` now skips upperdir redirection for `criKindSandbox` containers. Previously both the pause container and the workload container received the same `upperdirPath`, causing two overlay mounts to share the same `workdir` — which the kernel rejects. The pause container writes no business data; skipping it is safe and correct. Only workload containers (`criKindContainer`) now get the PV-backed upperdir.
+
+### Done — v0.1.7: Orphan lease GC, scrape hook, string constants (CURRENT RELEASE)
+
+Three changes:
+
+**1. Orphan lease GC (`countOrphanLeases` / `gcOrphanLeases` in `dedup.go`)**
+
+When `Remove()` fails to unpin a lease (e.g. pv-snapshotter restarted mid-flight), the lease becomes "orphaned" — its owning active snapshot no longer exists in `localSn` but the lease persists, keeping the overlayfs chainID pinned against GC. Two new methods on `dedupManager` address this:
+
+- `countOrphanLeases(ctx, ns)` — lists all leases labeled `pv-snapshotter.io/managed-by=pv-snapshotter`, checks each `owner-snapshot` label value against `localSn.Stat()`, and returns the count of orphans. Called by the scrape hook to refresh `pv_snapshotter_orphan_leases_total`.
+- `gcOrphanLeases(ctx, ns)` — same traversal; deletes each orphan lease, calls `pinnedSnapshotsTotal.Dec()` per deletion, and returns the count deleted. Best-effort: logs errors and continues the sweep on failure.
+
+**2. New Prometheus metric + `RegisterScrapeHook` implementation**
+
+- `pv_snapshotter_orphan_leases_total{node_name}` GaugeVec added to the `var (...)` metrics block in `service.go`. Refreshed on every `/metrics` scrape.
+- `RegisterScrapeHook(ctx context.Context)` was previously a TODO stub; it is now implemented: calls `countOrphanLeases` and updates the gauge. Wired in `main.go` via `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.3 API).
+- `POST /dedup/leases/gc` handler added: returns `{"deleted": N}` after calling `gcOrphanLeases`; returns 501 if dedup is not enabled.
+
+**3. String constants refactor**
+
+All bare `"k8s.io"` and `"kubernetes.io"` string literals in the snapshotter package replaced with named constants defined in `resolver.go`:
+
+| Constant | Value |
+|----------|-------|
+| `containerdNamespaceK8s` | `"k8s.io"` |
+| `reservedAnnotationPrefixKubernetes` | `"kubernetes.io"` |
+| `reservedAnnotationPrefixK8s` | `"k8s.io"` |
+
+Affected files: `resolver.go` (constant definitions + `validateAnnotationPrefix`), `service.go` (5 call sites), `dedup.go` (1 fallback namespace assignment). Import paths and template string fragments (`kubernetes.io~csi`) are intentionally left unchanged.
 
 ---
 

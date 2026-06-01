@@ -2,14 +2,13 @@ package main
 
 import (
 	"context"
-	"io"
 
-	"github.com/gin-gonic/gin"
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
 	"github.com/humble-mun/chassis/pkg/app"
+	"github.com/humble-mun/chassis/pkg/metrics"
 	"github.com/humble-mun/chassis/pkg/server"
 
 	"github.com/humble-mun/pv-snapshotter/pkg/containerd/snapshotter"
@@ -46,19 +45,19 @@ func newRootCommand() *cobra.Command {
 			}
 			logger = logger.WithValues("nodeName", nodeName)
 
-			var sn io.Closer
-			var registerRoute func(*gin.Engine)
-			if sn, registerRoute, err = snapshotter.RegisterGRPCService(rootLogger, nodeName, srv); err != nil {
+			var svc snapshotter.Service
+			if svc, err = snapshotter.RegisterGRPCService(rootLogger, nodeName, srv); err != nil {
 				logger.Error(err, "register snapshotter GRPC service failed")
 				return
 			}
 			defer func() {
-				if e := sn.Close(); e != nil {
+				if e := svc.Close(); e != nil {
 					logger.Error(e, "close snapshotter grpc service failed")
 				}
 			}()
 
-			httpGin.RegisterRoute(registerRoute)
+			httpGin.RegisterRoute(svc.RegisterRoute)
+			metrics.RegisterScrapeHook(svc.RegisterScrapeHook)
 
 			if webhook.Enabled() {
 				var h *webhook.Handler
