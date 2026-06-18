@@ -1,9 +1,6 @@
 package main
 
 import (
-	"context"
-
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc"
 
@@ -34,46 +31,42 @@ func newRootCommand() *cobra.Command {
 		RunE: func(_ *cobra.Command, _ []string) (err error) {
 			srv := grpc.NewServer()
 
-			var rootLogger, logger logr.Logger
-			var httpGin *server.HTTPServer
-			var ctx context.Context
-			var nodeName string
-			if rootLogger, logger, httpGin, ctx, nodeName, err = app.BaseContext(
+			var base app.Base
+			if base, err = app.BaseContext(
 				app.WithInit(init), app.WithGRPCServer(srv),
 				app.WithUnixListener(server.WithAddr(snapshotter.GetUnixSocketPath))); err != nil {
 				return
 			}
-			logger = logger.WithValues("nodeName", nodeName)
 
 			var svc snapshotter.Service
-			if svc, err = snapshotter.RegisterGRPCService(rootLogger, nodeName, srv); err != nil {
-				logger.Error(err, "register snapshotter GRPC service failed")
+			if svc, err = snapshotter.RegisterGRPCService(base.RootLogger, base.NodeName, srv); err != nil {
+				base.Logger.Error(err, "register snapshotter GRPC service failed")
 				return
 			}
 			defer func() {
 				if e := svc.Close(); e != nil {
-					logger.Error(e, "close snapshotter grpc service failed")
+					base.Logger.Error(e, "close snapshotter grpc service failed")
 				}
 			}()
 
-			httpGin.RegisterRoute(svc.RegisterRoute)
+			base.HTTPGin.RegisterRoute(svc.RegisterRoute)
 			metrics.RegisterScrapeHook(svc.RegisterScrapeHook)
 
 			if webhook.Enabled() {
 				var h *webhook.Handler
-				if h, err = webhook.New(rootLogger); err != nil {
+				if h, err = webhook.New(base.RootLogger); err != nil {
 					return
 				}
-				httpGin.RegisterRoute(h.RegisterRoute)
+				base.HTTPGin.RegisterRoute(h.RegisterRoute)
 			}
 
-			logger.Info("snapshotter started")
-			defer logger.Info("snapshotter finished")
-			if err = httpGin.Start(ctx); err != nil {
-				logger.Error(err, "start manager failed")
+			base.Logger.Info("snapshotter started")
+			defer base.Logger.Info("snapshotter finished")
+			if err = base.HTTPGin.Start(base.Ctx); err != nil {
+				base.Logger.Error(err, "start manager failed")
 				return
 			}
-			<-ctx.Done()
+			<-base.Ctx.Done()
 			return
 		},
 	}

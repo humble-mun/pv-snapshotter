@@ -47,14 +47,15 @@ func newConfigCommand() *cobra.Command {
 			"initContainers, Kubernetes ≥ 1.29) alongside the snapshotter daemon.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			_, logger, _, ctx, _, err := app.BaseContext(
+			base, err := app.BaseContext(
 				app.WithInit(initFn),
 				app.WithoutHTTPServer(),
 			)
 			if err != nil {
 				return fmt.Errorf("initialising base context: %w", err)
 			}
-			logger = logger.WithName("config")
+			ctx := base.Ctx
+			logger := base.RootLogger.WithName("config")
 
 			socketPath := pvconfig.GetSocketPath()
 

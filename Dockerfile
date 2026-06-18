@@ -1,4 +1,4 @@
-ARG GO_VERSION=1.26.3-trixie
+ARG GO_VERSION=1.26.4-trixie
 ARG BASE_IMAGE=gcr.io/distroless/base-debian13:latest
 
 FROM golang:${GO_VERSION} AS builder

@@ -1,6 +1,6 @@
 # pv-snapshotter
 
-> [中文文档](./README_CN.md)
+English | [简体中文](README_CN.md)
 
 > ⚠️ **DO NOT USE v0.1.3 IN PRODUCTION.**  v0.1.3 has a confirmed disk-pressure
 > bug: orphaned snapshot directories accumulate indefinitely under
@@ -648,7 +648,7 @@ the lease persists, keeping the overlayfs chainID pinned against GC. Two new met
   `/metrics` scrape.
 - `RegisterScrapeHook(ctx context.Context)` was previously a TODO stub; it is now
   implemented: calls `countOrphanLeases` and updates the gauge. Wired in `main.go` via
-  `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.3 API).
+  `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.7 API).
 - `POST /dedup/leases/gc` handler added: returns `{"deleted": N}` after calling
   `gcOrphanLeases`; returns 501 if dedup is not enabled.
 
@@ -769,4 +769,4 @@ pv-snapshotter is **production ready**. Core snapshotter, Helm chart, containerd
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](./LICENSE) and [NOTICE](./NOTICE) for details.
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.

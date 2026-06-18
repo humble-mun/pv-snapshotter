@@ -1,6 +1,6 @@
-# CLAUDE.md
+# AGENTS.md
 
-Reference document for AI coding tools (Claude Code, Cursor, Codex, etc.). Covers project purpose, architecture decisions, actual code structure, hard constraints, current status, and next steps. **Read this before making any changes.**
+This file provides guidance to AI agents when working with code in this repository.
 
 ---
 
@@ -556,7 +556,7 @@ When `Remove()` fails to unpin a lease (e.g. pv-snapshotter restarted mid-flight
 **2. New Prometheus metric + `RegisterScrapeHook` implementation**
 
 - `pv_snapshotter_orphan_leases_total{node_name}` GaugeVec added to the `var (...)` metrics block in `service.go`. Refreshed on every `/metrics` scrape.
-- `RegisterScrapeHook(ctx context.Context)` was previously a TODO stub; it is now implemented: calls `countOrphanLeases` and updates the gauge. Wired in `main.go` via `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.3 API).
+- `RegisterScrapeHook(ctx context.Context)` was previously a TODO stub; it is now implemented: calls `countOrphanLeases` and updates the gauge. Wired in `main.go` via `metrics.RegisterScrapeHook(svc.RegisterScrapeHook)` (chassis v0.1.7 API).
 - `POST /dedup/leases/gc` handler added: returns `{"deleted": N}` after calling `gcOrphanLeases`; returns 501 if dedup is not enabled.
 
 **3. String constants refactor**
