@@ -93,6 +93,11 @@ webhook:
 
   # pvcSelectorTemplate is a Go template rendered to a label selector string
   # used to list PVCs. Used only when pvcNameTemplate produces an empty value.
+  #
+  # Both global templates can be overridden per pod via the annotation
+  # "<annotationPrefix>/pvc-name-template" (suffix fixed; prefix = the top-level
+  # annotationPrefix above). Its value is a Go template rendered with the same
+  # variables as pvcNameTemplate, or a literal PVC name. See README for details.
   pvcSelectorTemplate: ""
 
   # maxOwnerDepth controls how many owner-reference hops to traverse when
@@ -124,7 +129,20 @@ webhook:
   # annotationTemplates is a map of annotation key → Go template value stamped
   # onto mutated pods.
   #
-  # THREE-LAYER RENDERING PIPELINE:
+  # Left empty by default ON PURPOSE: the canonical default lives in the binary
+  # (defaultAnnotationTemplates in pkg/webhook/mutating.go) and is applied
+  # whenever this map is empty. Keeping the chart default empty avoids Helm's
+  # map deep-merge, under which chart-default keys would otherwise leak into a
+  # user override (Helm merges maps key-by-key and never drops a default key).
+  # Set this map to take full ownership: the keys you provide REPLACE the binary
+  # default — they are not merged with it.
+  #
+  # The compiled-in default (suitable for ZFS LocalPV and any CSI driver that
+  # mounts directly under the kubelet pod volume tree, no globalmount staging) is:
+  #   pv-snapshotter.humble-mun.io/upperdir-path-template: '/var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount'
+  #   pv-snapshotter.humble-mun.io/var.PVName: '{{.PVName}}'
+  #
+  # THREE-LAYER RENDERING PIPELINE (applies to any value you set here):
   #
   #   Layer 1 — Helm renders daemonset.yaml. Values from this map are passed
   #              as a --webhook-annotation-templates command-line argument in
@@ -142,12 +160,7 @@ webhook:
   #   Layer 3 — pv-snapshotter re-renders the annotation value at Mounts()
   #              time. Variables resolved here: .PodUID, .PodName,
   #              .PodNamespace (+ any var.* annotations from the pod).
-  #
-  # The default is suitable for ZFS LocalPV and any CSI driver that mounts
-  # directly under the kubelet pod volume tree (no globalmount staging).
-  annotationTemplates:
-    pv-snapshotter.humble-mun.io/upperdir-path-template: '/var/lib/kubelet/pods/{{.PodUID}}/volumes/kubernetes.io~csi/{{.PVName}}/mount'
-    pv-snapshotter.humble-mun.io/var.PVName: '{{.PVName}}'
+  annotationTemplates: {}
 
   # namespaceSelector restricts which namespaces the webhook intercepts.
   # An empty selector matches all namespaces.
@@ -155,12 +168,15 @@ webhook:
 
   # objectSelector filters which pods the webhook intercepts.
   # Only pods whose labels match this selector are mutated; all others are
-  # admitted without modification. The default opt-in label keeps the webhook
-  # from touching every pod in the cluster — workloads must explicitly declare
-  # the label to receive state-volume injection.
-  objectSelector:
-    matchLabels:
-      pv-snapshotter.humble-mun.io/inject: "true"
+  # admitted without modification.
+  #
+  # Left empty by default ON PURPOSE (same Helm map-merge reason as
+  # annotationTemplates above): when empty, the chart applies a safe opt-in
+  # default selector — matchLabels "pv-snapshotter.humble-mun.io/inject: true" —
+  # so the webhook never touches every pod in the cluster; workloads must
+  # explicitly carry that label. Set this to provide your OWN selector, which
+  # fully replaces the default with no key leakage from the chart.
+  objectSelector: {}
 
 # ---------------------------------------------------------------------------
 # DaemonSet scheduling

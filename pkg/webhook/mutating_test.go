@@ -1,10 +1,12 @@
 package webhook
 
 import (
+	"context"
 	"testing"
 	"text/template"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestBuildPatchAddsStateMountOnlyToPrimaryContainer(t *testing.T) {
@@ -100,6 +102,47 @@ func TestBuildPatchAppendsStateMountToExistingPrimaryContainerMounts(t *testing.
 		t.Fatalf("expected appended volumeMount value, got %T", mountOps[0].Value)
 	}
 	assertStateMount(t, mount)
+}
+
+func TestResolvePVCFromAnnotationRejectsInvalidTemplate(t *testing.T) {
+	handler := &Handler{
+		pvcNameTmplAnnotation: "pv-snapshotter.humble-mun.io/pvc-name-template",
+	}
+
+	_, err := handler.resolvePVCFromAnnotation(context.Background(), "ns", "{{.OwnerName", templateData{})
+	if err == nil {
+		t.Fatal("expected error for an unparsable annotation template, got nil")
+	}
+}
+
+func TestResolvePVCFromAnnotationRejectsEmptyRender(t *testing.T) {
+	handler := &Handler{
+		pvcNameTmplAnnotation: "pv-snapshotter.humble-mun.io/pvc-name-template",
+	}
+
+	_, err := handler.resolvePVCFromAnnotation(context.Background(), "ns", "{{.OwnerName}}", templateData{OwnerName: ""})
+	if err == nil {
+		t.Fatal("expected error when the annotation renders an empty PVC name, got nil")
+	}
+}
+
+func TestResolvePVCRoutesThroughAnnotationOverride(t *testing.T) {
+	const annotationKey = "pv-snapshotter.humble-mun.io/pvc-name-template"
+	handler := &Handler{
+		pvcNameTmplAnnotation: annotationKey,
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Annotations: map[string]string{annotationKey: "{{.OwnerName"},
+		},
+	}
+
+	// An unparsable per-pod template proves the override path is taken without
+	// reaching the (nil) Kubernetes client used by the global resolution paths.
+	_, err := handler.resolvePVC(context.Background(), "ns", pod, templateData{})
+	if err == nil {
+		t.Fatal("expected the per-pod annotation override to be used, got nil error")
+	}
 }
 
 func filterOps(ops []jsonPatchOp, keep func(jsonPatchOp) bool) []jsonPatchOp {

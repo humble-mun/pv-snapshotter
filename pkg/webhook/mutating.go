@@ -25,6 +25,8 @@ import (
 	"k8s.io/client-go/dynamic"
 	"k8s.io/client-go/kubernetes"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/humble-mun/pv-snapshotter/pkg/annotation"
 )
 
 // ---------------------------------------------------------------------------
@@ -50,6 +52,12 @@ const (
 	defaultStateMountPath      = "/.platform/state"
 	defaultBoundTimeout        = 30 * time.Second
 	defaultEnabled             = true
+
+	// annotationSuffixPVCNameTemplate is the fixed annotation key suffix for the
+	// per-pod PVC-name override. The full key is derived at construction time as
+	// "<annotation-prefix>/pvc-name-template" (annotation.Key), so the prefix is
+	// configurable via --annotation-prefix while the suffix stays constant.
+	annotationSuffixPVCNameTemplate = "pvc-name-template"
 
 	// statePVCVolumeName is the volume name the webhook injects for the
 	// state PVC. The double-dash vendor-separator prefix makes it collision-
@@ -133,17 +141,18 @@ func Enabled() bool {
 //     by that PVC and stamps pv-snapshotter annotations onto the pod, enabling
 //     pv-backed overlay routing.
 type Handler struct {
-	logger              logr.Logger
-	client              kubernetes.Interface
-	dynamic             dynamic.Interface
-	pvcNameTmpl         *template.Template
-	pvcSelectorTmpl     *template.Template
-	annotationTmpls     map[string]*template.Template
-	maxOwnerDepth       int
-	defaultRuntimeClass string
-	runtimeClassSuffix  string
-	stateMountPath      string
-	boundTimeout        time.Duration
+	logger                logr.Logger
+	client                kubernetes.Interface
+	dynamic               dynamic.Interface
+	pvcNameTmpl           *template.Template
+	pvcSelectorTmpl       *template.Template
+	pvcNameTmplAnnotation string
+	annotationTmpls       map[string]*template.Template
+	maxOwnerDepth         int
+	defaultRuntimeClass   string
+	runtimeClassSuffix    string
+	stateMountPath        string
+	boundTimeout          time.Duration
 }
 
 // New constructs a Handler from viper-resolved flags.
@@ -175,6 +184,15 @@ func New(logger logr.Logger) (*Handler, error) {
 		return nil, fmt.Errorf("parsing --%s: %w", flagPVCSelectorTemplate, terr)
 	}
 
+	// The per-pod PVC-name override annotation key shares the configurable
+	// --annotation-prefix with the snapshotter resolver; only the suffix is
+	// fixed. This keeps a single prefix authoritative across the daemon.
+	prefix, perr := annotation.ResolvePrefix()
+	if perr != nil {
+		return nil, perr
+	}
+	pvcNameTmplAnnotation := annotation.Key(prefix, annotationSuffixPVCNameTemplate)
+
 	// Read annotation templates directly from the pflag layer via viper.
 	// IMPORTANT: viper.GetStringMapString is safe here ONLY because
 	// webhook-annotation-templates is never written to daemon.yaml (the viper
@@ -195,17 +213,18 @@ func New(logger logr.Logger) (*Handler, error) {
 	}
 
 	return &Handler{
-		logger:              logger,
-		client:              kc,
-		dynamic:             dc,
-		pvcNameTmpl:         pvcNameTmpl,
-		pvcSelectorTmpl:     pvcSelectorTmpl,
-		annotationTmpls:     annotationTmpls,
-		maxOwnerDepth:       viper.GetInt(flagMaxOwnerDepth),
-		defaultRuntimeClass: viper.GetString(flagDefaultRuntimeClass),
-		runtimeClassSuffix:  viper.GetString(flagRuntimeClassSuffix),
-		stateMountPath:      viper.GetString(flagStateMountPath),
-		boundTimeout:        viper.GetDuration(flagBoundTimeout),
+		logger:                logger,
+		client:                kc,
+		dynamic:               dc,
+		pvcNameTmpl:           pvcNameTmpl,
+		pvcSelectorTmpl:       pvcSelectorTmpl,
+		pvcNameTmplAnnotation: pvcNameTmplAnnotation,
+		annotationTmpls:       annotationTmpls,
+		maxOwnerDepth:         viper.GetInt(flagMaxOwnerDepth),
+		defaultRuntimeClass:   viper.GetString(flagDefaultRuntimeClass),
+		runtimeClassSuffix:    viper.GetString(flagRuntimeClassSuffix),
+		stateMountPath:        viper.GetString(flagStateMountPath),
+		boundTimeout:          viper.GetDuration(flagBoundTimeout),
 	}, nil
 }
 
@@ -300,7 +319,7 @@ func (h *Handler) mutate(ctx context.Context, req *admissionv1.AdmissionRequest)
 		PodUID:       "{{.PodUID}}",
 		PodNamespace: "{{.PodNamespace}}",
 	}
-	pvc, err := h.resolvePVC(ctx, req.Namespace, data)
+	pvc, err := h.resolvePVC(ctx, req.Namespace, &pod, data)
 	if err != nil {
 		log.Error(err, "failed to resolve PVC", "ownerName", ownerName)
 		return deny(req.UID, fmt.Sprintf("resolving PVC for owner %q: %v", ownerName, err))
@@ -432,12 +451,25 @@ func ownerRefToGVR(ref *metav1.OwnerReference) (schema.GroupVersionResource, err
 // resolvePVC finds the PVC to bind to the pod.
 //
 // Resolution order:
-//  1. Render pvcNameTmpl; if non-empty, fetch the PVC by name (hard error if absent).
-//  2. Fall back to pvcSelectorTmpl; render the selector, list PVCs, take the first
+//  1. Per-pod override: if the pod sets the pvcNameTmplAnnotation annotation,
+//     render its value (same template variables as pvcNameTmpl) and fetch the
+//     PVC by that name. This lets a pod select a PVC whose lifecycle is
+//     independent of the pod/owner name; the annotation value may also be a
+//     literal PVC name with no template actions. The override bypasses the
+//     global name and selector templates, and a rendered-empty value is a hard
+//     error rather than a fallback.
+//  2. Render pvcNameTmpl; if non-empty, fetch the PVC by name (hard error if absent).
+//  3. Fall back to pvcSelectorTmpl; render the selector, list PVCs, take the first
 //     result (warning logged when multiple match).
 //
 // Returns an error when no PVC is found, causing the pod to be denied.
-func (h *Handler) resolvePVC(ctx context.Context, ns string, data templateData) (*corev1.PersistentVolumeClaim, error) {
+func (h *Handler) resolvePVC(ctx context.Context, ns string, pod *corev1.Pod, data templateData) (*corev1.PersistentVolumeClaim, error) {
+	if h.pvcNameTmplAnnotation != "" {
+		if tmplText, ok := pod.Annotations[h.pvcNameTmplAnnotation]; ok {
+			return h.resolvePVCFromAnnotation(ctx, ns, tmplText, data)
+		}
+	}
+
 	pvcName, err := renderTemplate(h.pvcNameTmpl, data)
 	if err != nil {
 		return nil, fmt.Errorf("rendering pvc-name-template: %w", err)
@@ -484,6 +516,30 @@ func (h *Handler) resolvePVC(ctx context.Context, ns string, data templateData) 
 			"selector", selectorStr, "pvcs", names)
 	}
 	return &list.Items[0], nil
+}
+
+// resolvePVCFromAnnotation renders a per-pod PVC-name template (the value of the
+// pvcNameTmplAnnotation annotation) and fetches the named PVC. The template is
+// compiled per request because its text is supplied by the pod rather than by
+// flags. An empty render is rejected: when a pod opts into the override, falling
+// back to the global templates would silently ignore the pod's intent.
+func (h *Handler) resolvePVCFromAnnotation(ctx context.Context, ns, tmplText string, data templateData) (*corev1.PersistentVolumeClaim, error) {
+	tmpl, err := parseTemplate("pvc-name-annotation", tmplText)
+	if err != nil {
+		return nil, fmt.Errorf("parsing pod annotation %q as template: %w", h.pvcNameTmplAnnotation, err)
+	}
+	pvcName, err := renderTemplate(tmpl, data)
+	if err != nil {
+		return nil, fmt.Errorf("rendering pod annotation %q: %w", h.pvcNameTmplAnnotation, err)
+	}
+	if pvcName == "" {
+		return nil, fmt.Errorf("pod annotation %q rendered an empty PVC name", h.pvcNameTmplAnnotation)
+	}
+	pvc, err := h.client.CoreV1().PersistentVolumeClaims(ns).Get(ctx, pvcName, metav1.GetOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("fetching PVC %q (from pod annotation %q): %w", pvcName, h.pvcNameTmplAnnotation, err)
+	}
+	return pvc, nil
 }
 
 // ---------------------------------------------------------------------------

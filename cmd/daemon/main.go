@@ -7,7 +7,9 @@ import (
 	"github.com/humble-mun/chassis/pkg/app"
 	"github.com/humble-mun/chassis/pkg/metrics"
 	"github.com/humble-mun/chassis/pkg/server"
+	"github.com/humble-mun/chassis/pkg/version"
 
+	"github.com/humble-mun/pv-snapshotter/pkg/annotation"
 	"github.com/humble-mun/pv-snapshotter/pkg/containerd/snapshotter"
 	"github.com/humble-mun/pv-snapshotter/pkg/webhook"
 )
@@ -15,7 +17,7 @@ import (
 func newRootCommand() *cobra.Command {
 	var init func() error
 	cmd := &cobra.Command{
-		Use:   snapshotter.Name,
+		Use:   version.Name,
 		Short: "containerd proxy snapshotter (gRPC plugin) that redirects the overlay upperdir/workdir.",
 		Long: "A containerd proxy snapshotter that rewrites overlay mount options so that upperdir and " +
 			"workdir point at a caller-provided path (for example, a mounted PersistentVolume) when a pod " +
@@ -71,7 +73,8 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 
-	init = app.PrepareFlags(snapshotter.Name, cmd, snapshotter.RegisterFlags, webhook.RegisterFlags)
+	init = app.PrepareFlags(version.Name, cmd,
+		annotation.RegisterFlags, snapshotter.RegisterFlags, webhook.RegisterFlags)
 	cmd.AddCommand(newConfigCommand())
 	return cmd
 }

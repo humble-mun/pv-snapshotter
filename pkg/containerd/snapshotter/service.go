@@ -24,13 +24,9 @@ import (
 )
 
 const (
-	// Name is the service identifier used by the daemon.
-	Name = "daemon"
-
 	flagUnixSocketPath    = "unix-socket-path"
 	defaultUnixSocketPath = "/var/run/pv-snapshotter/daemon.sock"
 	flagContainerdSocket  = "containerd-socket"
-	flagAnnotationPrefix  = "annotation-prefix"
 
 	// flagShareOverlayfsLowers enables the dedup path: when a container image's
 	// read-only layers are already present in the host's native overlayfs
@@ -45,13 +41,6 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagUnixSocketPath, defaultUnixSocketPath, "The path to the unix socket file.")
 	pfs.String(flagContainerdSocket, defaultContainerdSocket,
 		"Path to the containerd gRPC socket, used to resolve pod annotations.")
-	pfs.String(flagAnnotationPrefix, defaultAnnotationPrefix,
-		"DNS subdomain prefix for all pv-snapshotter pod annotations (must be a valid "+
-			"RFC 1123 DNS subdomain, no trailing slash). The following annotation keys are "+
-			"derived from this prefix at startup:\n"+
-			"  <prefix>/upperdir-path          – literal upperdir root path\n"+
-			"  <prefix>/upperdir-path-template – Go template rendered to upperdir root path\n"+
-			"  <prefix>/var.<Name>             – template variable injected into template data")
 	pfs.Bool(flagShareOverlayfsLowers, false,
 		"Enable dedup: reuse overlayfs read-only layers instead of re-unpacking. "+
 			"When set, Stat() lazily creates reference snapshots (fs/ symlinked into "+

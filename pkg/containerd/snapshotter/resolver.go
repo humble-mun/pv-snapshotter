@@ -14,15 +14,11 @@ import (
 	"github.com/containerd/containerd/v2/pkg/namespaces"
 	typeurlv2 "github.com/containerd/typeurl/v2"
 	"github.com/go-logr/logr"
-	"github.com/spf13/viper"
-	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/humble-mun/pv-snapshotter/pkg/annotation"
 )
 
 const (
-	// defaultAnnotationPrefix is the default DNS subdomain prefix for all
-	// pv-snapshotter pod annotations. Configurable via --annotation-prefix.
-	defaultAnnotationPrefix = "pv-snapshotter.humble-mun.io"
-
 	// Annotation name suffixes (appended to prefix + "/").
 	//
 	//   <prefix>/upperdir-path          – literal upperdir root path
@@ -49,12 +45,6 @@ const (
 	// containerdNamespaceK8s is the containerd namespace used by the CRI
 	// plugin for all Kubernetes workloads.
 	containerdNamespaceK8s = "k8s.io"
-
-	// reservedAnnotationPrefixKubernetes and reservedAnnotationPrefixK8s are
-	// the two Kubernetes-reserved DNS subdomains that must not be used as the
-	// pv-snapshotter annotation prefix.
-	reservedAnnotationPrefixKubernetes = "kubernetes.io"
-	reservedAnnotationPrefixK8s        = "k8s.io"
 )
 
 // sandboxMetadata mirrors the versioned wrapper used by containerd CRI:
@@ -93,40 +83,20 @@ type resolver struct {
 	keyVarPrefix string // <prefix>/var.
 }
 
-// validateAnnotationPrefix checks that prefix is a valid Kubernetes annotation
-// key prefix (RFC 1123 DNS subdomain, ≤253 chars, no trailing slash).
-//
-// The reserved prefixes "kubernetes.io" and "k8s.io" are rejected to avoid
-// conflicts with built-in annotations.
-func validateAnnotationPrefix(prefix string) error {
-	if strings.HasSuffix(prefix, "/") {
-		return fmt.Errorf("annotation prefix must not include a trailing slash: %q", prefix)
+func newResolver(logger logr.Logger, client *containerd.Client) (r *resolver, err error) {
+	var prefix string
+	if prefix, err = annotation.ResolvePrefix(); err != nil {
+		return
 	}
-	if errs := validation.IsDNS1123Subdomain(prefix); len(errs) > 0 {
-		return fmt.Errorf("annotation prefix %q is not a valid DNS subdomain: %s",
-			prefix, strings.Join(errs, "; "))
-	}
-	if prefix == reservedAnnotationPrefixKubernetes || prefix == reservedAnnotationPrefixK8s ||
-		strings.HasSuffix(prefix, "."+reservedAnnotationPrefixKubernetes) || strings.HasSuffix(prefix, "."+reservedAnnotationPrefixK8s) {
-		return fmt.Errorf("annotation prefix %q uses a reserved Kubernetes domain", prefix)
-	}
-	return nil
-}
 
-func newResolver(logger logr.Logger, client *containerd.Client) (*resolver, error) {
-	prefix := viper.GetString(flagAnnotationPrefix)
-	if err := validateAnnotationPrefix(prefix); err != nil {
-		return nil, fmt.Errorf("invalid --annotation-prefix: %w", err)
-	}
-	base := prefix + "/"
-
-	return &resolver{
+	r = &resolver{
 		client:       client,
 		logger:       logger.WithName("resolver"),
-		keyLiteral:   base + annotationSuffixUpperdirPath,
-		keyTemplate:  base + annotationSuffixUpperdirPathTemplate,
-		keyVarPrefix: base + annotationSuffixVarSubPrefix,
-	}, nil
+		keyLiteral:   annotation.Key(prefix, annotationSuffixUpperdirPath),
+		keyTemplate:  annotation.Key(prefix, annotationSuffixUpperdirPathTemplate),
+		keyVarPrefix: annotation.Key(prefix, annotationSuffixVarSubPrefix),
+	}
+	return
 }
 
 // resolveAtMountsTime extracts the upperdir-path annotation for the container

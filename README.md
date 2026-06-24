@@ -247,7 +247,10 @@ The webhook is enabled by default (`webhook.enabled=true` in `values.yaml`). It 
 When a Pod is admitted and its labels match the configured `objectSelector` (default: `pv-snapshotter.humble-mun.io/inject: "true"`), the webhook:
 
 1. **Resolves the controlling owner** by traversing owner references up to `maxOwnerDepth` hops (default 2: pod → ReplicaSet → Deployment). The resolved name becomes `OwnerName`.
-2. **Looks up the associated PVC** using `pvcNameTemplate` (default `{{.OwnerName}}`), then waits up to `boundTimeout` (default 10 s) for it to reach Bound. Denies the pod if the PVC does not bind in time — pv-snapshotter cannot prepare the overlay upperdir on an unbound volume, so admitting early only defers the failure to the node.
+2. **Looks up the associated PVC**, then waits up to `boundTimeout` (default 10 s) for it to reach Bound. Denies the pod if the PVC does not bind in time — pv-snapshotter cannot prepare the overlay upperdir on an unbound volume, so admitting early only defers the failure to the node. The PVC name is resolved in this order:
+   - **Per-pod override**: if the pod sets the `<annotation-prefix>/pvc-name-template` annotation (e.g. `pv-snapshotter.humble-mun.io/pvc-name-template`; the prefix is the configurable `--annotation-prefix`, the suffix is fixed), its value is rendered as a Go template (same variables as `pvcNameTemplate`) and used as the PVC name. This lets a pod bind a PVC whose lifecycle is independent of the pod/owner name (e.g. selecting one of several pre-provisioned PVCs at launch). The value may also be a literal PVC name with no template actions. A rendered-empty value is rejected rather than falling back.
+   - **Global name template**: otherwise `pvcNameTemplate` (default `{{.OwnerName}}`) is rendered and the PVC fetched by that name.
+   - **Global selector template**: when `pvcNameTemplate` renders empty, `pvcSelectorTemplate` is used to list PVCs and the first match is taken.
 3. **Fetches the backing PV** and extracts `spec.csi.volumeHandle` (empty for non-CSI PVs).
 4. **Builds a JSON Patch** that:
    - Stamps `upperdir-path-template` and `var.PVName` annotations onto the pod.
@@ -368,7 +371,7 @@ Key values:
 | `webhook.enabled` | `true` | Enable webhook, RBAC, cert-manager Certificate, and MutatingWebhookConfiguration |
 | `webhook.clusterIssuerName` | `selfsigned` | cert-manager ClusterIssuer for the webhook TLS certificate |
 | `webhook.objectSelector` | `matchLabels: pv-snapshotter.humble-mun.io/inject: "true"` | Only pods matching this selector are mutated |
-| `webhook.pvcNameTemplate` | `{{.OwnerName}}` | Go template → PVC name to look up |
+| `webhook.pvcNameTemplate` | `{{.OwnerName}}` | Go template → PVC name to look up (a pod may override per-pod via the `<annotationPrefix>/pvc-name-template` annotation) |
 | `webhook.maxOwnerDepth` | `2` | Owner-reference traversal depth |
 | `webhook.defaultRuntimeClass` | `runc` | Base RuntimeClass when pod has none |
 | `webhook.runtimeClassSuffix` | `-pv` | Suffix appended to form the pv-backed RuntimeClass name |
@@ -625,7 +628,14 @@ branch:
 
 ## Changelog
 
-### v0.1.7 — Orphan lease GC, scrape hook, string constants (CURRENT RELEASE)
+### v0.1.8 — Shared annotation package + per-pod PVC override (CURRENT RELEASE)
+
+- **Shared `pkg/annotation` package.** The `--annotation-prefix` logic (flag registration, RFC 1123 validation, prefix resolution, key building) was extracted into a constraint-free package shared by the snapshotter resolver and the mutating webhook. The flag is now registered by `annotation.RegisterFlags` (wired from `main.go`); the validation helper and reserved-domain constants are package-private.
+- **Per-pod PVC name override.** A pod may set the `<annotation-prefix>/pvc-name-template` annotation (fixed suffix, configurable prefix) to override the global `--webhook-pvc-name-template` / `--webhook-pvc-selector-template`. The value is a Go template (same variables as the name template) or a literal PVC name; a rendered-empty value is rejected. This lets a pod bind a PVC whose lifecycle is independent of the pod/owner name.
+- **Helm: leak-free map overrides.** `webhook.annotationTemplates` and `webhook.objectSelector` now default to `{}` in `values.yaml`. Helm deep-merges map values key-by-key and never drops a chart-default key, so non-empty map defaults leaked into user `-f` overrides. The canonical defaults now live where merge cannot reach: `annotationTemplates` falls back to the binary's compiled-in default (the DaemonSet only passes `--webhook-annotation-templates` when the map is non-empty), and the `objectSelector` opt-in label (`pv-snapshotter.humble-mun.io/inject: "true"`) moved into the `webhook.yaml` template `else` branch. A user-supplied value now fully **replaces** the default instead of being key-merged with it.
+- **chassis v0.1.10 (config-loading fix).** Bumped `github.com/humble-mun/chassis` v0.1.7 → v0.1.10, which defers the global viper `SetConfigName`/`AddConfigPath` into the config-loader closure. Previously, registering the `config` subcommand overwrote the root command's config name on the shared global viper, so the daemon read the wrong file and silently fell back to compiled-in defaults (empty `root-path`, bind `0.0.0.0:8080`, default TLS path → crash). The daemon now reliably loads `/etc/humble-mun/daemon.yaml`.
+
+### v0.1.7 — Orphan lease GC, scrape hook, string constants
 
 **1. Orphan lease GC (`countOrphanLeases` / `gcOrphanLeases` in `dedup.go`)**
 

@@ -223,6 +223,8 @@ pv-snapshotter/
 │       ├── main.go              # root command (daemon gRPC server + webhook)
 │       └── config.go            # "config" subcommand (sidecar lifecycle)
 ├── pkg/
+│   ├── annotation/             # shared annotation-prefix logic (no build constraints)
+│   │   └── prefix.go           # --annotation-prefix flag, validation, ResolvePrefix, Key
 │   ├── containerd/
 │   │   ├── config/              # containerd config patching + sidecar support (all files: //go:build linux)
 │   │   │   ├── flags.go         # flag constants, RegisterFlags, GetParams, GetSocketPath
@@ -274,13 +276,13 @@ type snapshotter struct {
 
 No `pvBacked` field. There is no separate branch snapshotter. The redirected path is purely a mount options rewrite in `Mounts()`.
 
-### CLI flags (service.go + resolver.go + mutating.go)
+### CLI flags (annotation/prefix.go + service.go + mutating.go)
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--unix-socket-path` | `/var/run/pv-snapshotter/daemon.sock` | gRPC listener socket |
 | `--containerd-socket` | `/run/containerd/containerd.sock` | containerd client socket |
-| `--annotation-prefix` | `pv-snapshotter.humble-mun.io` | Pod annotation DNS subdomain prefix; all three annotation keys derived from this at startup |
+| `--annotation-prefix` | `pv-snapshotter.humble-mun.io` | Pod annotation DNS subdomain prefix; all annotation keys (resolver upperdir keys + webhook `pvc-name-template`) derived from this at startup |
 | `--overlay-snapshotter.root-path` | `/var/lib/containerd/io.containerd.snapshotter.v1.pv-snapshotter` | Native overlay snapshotter root (pv-snapshotter's own `snapshots/` + `metadata.db`) |
 | `--overlay-snapshotter.upper-dir-label` | `false` | Enable `containerd.io/snapshot/overlay.upperdir` label on snapshots |
 | `--overlay-snapshotter.sync-remove` | `false` | Synchronous snapshot removal |
@@ -542,7 +544,7 @@ pv-snapshotter previously re-unpacked image layers into its own `metadata.db` fo
 
 `resolver.go` now skips upperdir redirection for `criKindSandbox` containers. Previously both the pause container and the workload container received the same `upperdirPath`, causing two overlay mounts to share the same `workdir` — which the kernel rejects. The pause container writes no business data; skipping it is safe and correct. Only workload containers (`criKindContainer`) now get the PV-backed upperdir.
 
-### Done — v0.1.7: Orphan lease GC, scrape hook, string constants (CURRENT RELEASE)
+### Done — v0.1.7: Orphan lease GC, scrape hook, string constants
 
 Three changes:
 
@@ -570,6 +572,26 @@ All bare `"k8s.io"` and `"kubernetes.io"` string literals in the snapshotter pac
 | `reservedAnnotationPrefixK8s` | `"k8s.io"` |
 
 Affected files: `resolver.go` (constant definitions + `validateAnnotationPrefix`), `service.go` (5 call sites), `dedup.go` (1 fallback namespace assignment). Import paths and template string fragments (`kubernetes.io~csi`) are intentionally left unchanged.
+
+---
+
+### Done — v0.1.8: Shared annotation package + per-pod PVC override (CURRENT RELEASE)
+
+**1. Shared `pkg/annotation` package**
+
+The annotation-prefix logic was extracted from the (linux-only) snapshotter into a new constraint-free `pkg/annotation` package so the cross-platform webhook can reuse it. Exported API: `RegisterFlags` (registers `--annotation-prefix`, now wired from `main.go`), `ResolvePrefix` (viper read + validation), `Key(prefix, suffix)`. The validation helper and reserved-domain constants moved here and are now package-private — `validateAnnotationPrefix` → `validatePrefix`, `reservedAnnotationPrefixKubernetes`/`reservedAnnotationPrefixK8s` → `reservedPrefixKubernetes`/`reservedPrefixK8s`. `resolver.go` and `service.go` now consume the shared package; the `--annotation-prefix` flag is registered by `annotation.RegisterFlags` (no longer by `service.go`). `containerdNamespaceK8s` stays in `resolver.go`.
+
+**2. Per-pod PVC name override (webhook)**
+
+A pod may override the global `--webhook-pvc-name-template` / `--webhook-pvc-selector-template` by setting the `<annotation-prefix>/pvc-name-template` annotation (suffix fixed, prefix configurable via the shared `--annotation-prefix`). Its value is a Go template rendered with the same variables as the name template (or a literal PVC name); a rendered-empty value is rejected rather than falling back. This lets a pod bind a PVC whose lifecycle is independent of the pod/owner name.
+
+**3. Helm chart: leak-free map defaults**
+
+`webhook.annotationTemplates` and `webhook.objectSelector` now default to `{}` in `values.yaml`. Helm deep-merges map values key-by-key and never drops a chart-default key, so non-empty map defaults leaked into user `-f` overrides (a user could not cleanly replace them). The canonical defaults now live where merge cannot reach: `annotationTemplates` falls back to the binary's compiled-in `defaultAnnotationTemplates` (the DaemonSet only passes `--webhook-annotation-templates` when the map is non-empty), and the `objectSelector` opt-in label (`pv-snapshotter.humble-mun.io/inject: "true"`) moved into the `webhook.yaml` template `else` branch. A user-supplied value now fully replaces the default. Net default behavior is unchanged.
+
+**4. chassis v0.1.10 — viper config-name fix**
+
+Bumped `github.com/humble-mun/chassis` v0.1.7 → v0.1.10. `RegisterToViper` previously called `viper.SetConfigName`/`AddConfigPath` eagerly at registration time on the global viper; registering the `config` subcommand (`newConfigCommand`) then overwrote the root command's `"daemon"` config name, so the daemon's loader read `/etc/humble-mun/config.yaml` (absent), swallowed the not-found error, and fell back to all compiled-in defaults (empty `root-path`, bind `0.0.0.0:8080`, default TLS path → startup crash). v0.1.10 defers those mutations into the loader closure so each command applies its own config name immediately before `ReadInConfig`. Guarded by a chassis regression test (`TestRegisterToViperSubcommandDoesNotClobberConfigName`).
 
 ---
 
