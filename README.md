@@ -267,8 +267,10 @@ Annotations are rendered through a three-layer pipeline:
 | Layer | Renderer | Variables | Purpose |
 |-------|----------|-----------|---------|
 | 1 | Helm | `values.yaml` | Renders `--webhook-annotation-templates` CLI arg |
-| 2 | Webhook | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName` | Resolves storage-side values; stamps annotation onto pod |
+| 2 | Webhook | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName`, `.PodIndex` | Resolves storage-side values; stamps annotation onto pod |
 | 3 | pv-snapshotter | `.PodUID`, `.PodName`, `.PodNamespace`, `var.*` | Resolves pod-identity values at `Mounts()` time |
+
+> **Note on `.PodIndex`:** it is read verbatim from the pod's `apps.kubernetes.io/pod-index` label (StatefulSet and Indexed Job pods, Kubernetes 1.28+, KEP-2164). Pods without that label — e.g. plain Deployments/DaemonSets, or non-indexed workloads — render `.PodIndex` as an empty string. It is the template author's responsibility to handle that case (e.g. a conditional, or only using `.PodIndex` on templates scoped to indexed workloads) rather than assuming a numeric value is always present.
 
 The default `upperdir-path-template` value:
 
@@ -628,7 +630,11 @@ branch:
 
 ## Changelog
 
-### v0.1.8 — Shared annotation package + per-pod PVC override (CURRENT RELEASE)
+### v0.1.9 — `.PodIndex` template variable (CURRENT RELEASE)
+
+- **`.PodIndex` template variable.** The webhook's `templateData` gained a `PodIndex` field, resolved from the pod's `apps.kubernetes.io/pod-index` label (StatefulSet and Indexed Job pods, Kubernetes 1.28+, KEP-2164) and available in `--webhook-pvc-name-template`, `--webhook-pvc-selector-template`, `--webhook-annotation-templates`, and the per-pod `<annotation-prefix>/pvc-name-template` override. It is a direct, unvalidated pass-through of the label value: pods without the label render `.PodIndex` as an empty string rather than failing, so templates relying on it must handle that case explicitly.
+
+### v0.1.8 — Shared annotation package + per-pod PVC override
 
 - **Shared `pkg/annotation` package.** The `--annotation-prefix` logic (flag registration, RFC 1123 validation, prefix resolution, key building) was extracted into a constraint-free package shared by the snapshotter resolver and the mutating webhook. The flag is now registered by `annotation.RegisterFlags` (wired from `main.go`); the validation helper and reserved-domain constants are package-private.
 - **Per-pod PVC name override.** A pod may set the `<annotation-prefix>/pvc-name-template` annotation (fixed suffix, configurable prefix) to override the global `--webhook-pvc-name-template` / `--webhook-pvc-selector-template`. The value is a Go template (same variables as the name template) or a literal PVC name; a rendered-empty value is rejected. This lets a pod bind a PVC whose lifecycle is independent of the pod/owner name.

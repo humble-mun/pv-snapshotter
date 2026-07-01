@@ -65,6 +65,13 @@ const (
 	// this name is unlikely to clash with an existing volume in the pod.
 	statePVCVolumeName = "pv-snapshotter--state"
 
+	// podIndexLabel is the well-known label Kubernetes sets on StatefulSet
+	// pods and Indexed Job pods (1.28+, KEP-2164) holding the pod's ordinal /
+	// completion index. It is read as a plain pod label rather than parsed
+	// out of the pod name so the value keeps working regardless of naming
+	// scheme.
+	podIndexLabel = "apps.kubernetes.io/pod-index"
+
 	// boundPollInterval is the pause between PVC phase re-checks.
 	boundPollInterval = 2 * time.Second
 )
@@ -74,8 +81,8 @@ const (
 //
 // This is a two-layer template pipeline:
 //
-//	Layer 2 (webhook): variables .PVName, .OwnerName, .PodName, .VolumeHandle
-//	are resolved at admission time.  Variables .PodUID and .PodNamespace are
+//	Layer 2 (webhook): variables .PVName, .OwnerName, .PodName, .PodIndex,
+//	.VolumeHandle are resolved at admission time.  Variables .PodUID and .PodNamespace are
 //	pre-populated with their own template action text ("{{.PodUID}}" etc.) so
 //	that they pass through unchanged as annotation values.
 //
@@ -95,7 +102,7 @@ var defaultAnnotationTemplates = map[string]string{
 func RegisterFlags(pfs *pflag.FlagSet) {
 	pfs.String(flagPVCNameTemplate, defaultPVCNameTemplate,
 		"Go template rendered to the PVC name to bind to the pod. "+
-			"Template variables: .OwnerName, .PodName.")
+			"Template variables: .OwnerName, .PodName, .PodIndex.")
 	pfs.String(flagPVCSelectorTemplate, defaultPVCSelectorTemplate,
 		"Go template rendered to a label selector string used to list PVCs. "+
 			"Used only when --"+flagPVCNameTemplate+" produces an empty value.")
@@ -111,7 +118,7 @@ func RegisterFlags(pfs *pflag.FlagSet) {
 			" when the pod has none) to select the pv-backed RuntimeClass.")
 	pfs.StringToString(flagAnnotationTemplates, defaultAnnotationTemplates,
 		"Map of annotation key=Go-template-value stamped onto mutated pods. "+
-			"Template variables: .OwnerName, .PodName, .PVName, .VolumeHandle.")
+			"Template variables: .OwnerName, .PodName, .PodIndex, .PVName, .VolumeHandle.")
 	pfs.String(flagStateMountPath, defaultStateMountPath,
 		"Container mount path for the injected state volume on the primary container.")
 	pfs.Duration(flagBoundTimeout, defaultBoundTimeout,
@@ -266,8 +273,8 @@ func (h *Handler) handle(c *gin.Context) {
 
 // templateData carries the variables available in every rendered template.
 //
-// Layer-2 variables (.PVName, .VolumeHandle, .OwnerName, .PodName) are
-// resolved by the webhook and substituted at admission time.
+// Layer-2 variables (.PVName, .VolumeHandle, .OwnerName, .PodName, .PodIndex)
+// are resolved by the webhook and substituted at admission time.
 //
 // Layer-3 pass-through fields (.PodUID, .PodNamespace) are pre-populated with
 // their own Go template action strings (e.g. PodUID = "{{.PodUID}}"). When the
@@ -284,6 +291,10 @@ type templateData struct {
 	PodName      string
 	PVName       string
 	VolumeHandle string
+	// PodIndex is the pod's ordinal/completion-index from the
+	// "apps.kubernetes.io/pod-index" label (StatefulSet and Indexed Job
+	// pods, Kubernetes 1.28+). Empty when the pod carries no such label.
+	PodIndex string
 
 	// Layer-3 pass-throughs: set to their own template action text so that
 	// {{.PodUID}} in an annotation template renders as the literal string
@@ -313,6 +324,7 @@ func (h *Handler) mutate(ctx context.Context, req *admissionv1.AdmissionRequest)
 	data := templateData{
 		OwnerName: ownerName,
 		PodName:   req.Name,
+		PodIndex:  pod.Labels[podIndexLabel],
 		// Pre-populate Layer-3 pass-through fields with their own action text.
 		// Templates that reference {{.PodUID}} will output "{{.PodUID}}"
 		// literally, which pv-snapshotter re-renders at Mounts() time.

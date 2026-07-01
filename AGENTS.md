@@ -481,10 +481,12 @@ The `webhook-annotation-templates` flag drives a three-layer rendering pipeline:
 | Layer | Renderer | Variables resolved | Output |
 |-------|----------|--------------------|--------|
 | 1 | Helm | `values.yaml` → CLI arg | `--webhook-annotation-templates=k=v,...` (pflag CSV) |
-| 2 | Webhook (`text/template`) | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName` | annotation value patched onto pod |
+| 2 | Webhook (`text/template`) | `.PVName`, `.VolumeHandle`, `.OwnerName`, `.PodName`, `.PodIndex` | annotation value patched onto pod |
 | 3 | pv-snapshotter (`text/template`) | `.PodUID`, `.PodName`, `.PodNamespace`, `var.*` | final `upperdir` path |
 
 Layer-3 pass-through: `templateData.PodUID` is pre-populated with the string `"{{.PodUID}}"` so that `{{.PodUID}}` in a Layer-2 template renders as the literal `{{.PodUID}}` — which pv-snapshotter re-renders at `Mounts()` time.
+
+**Note on `.PodIndex`:** unlike `.OwnerName`/`.PodName` (always resolvable), `templateData.PodIndex` is a direct pass-through of the pod's `apps.kubernetes.io/pod-index` label (StatefulSet and Indexed Job pods, Kubernetes 1.28+, KEP-2164) — `pod.Labels[podIndexLabel]` with no validation or parsing. Pods without that label render `.PodIndex` as an empty string rather than erroring; it is the caller's (template author's) responsibility to only rely on `.PodIndex` for workloads known to carry the label, or to handle the empty case explicitly.
 
 **Critical constraint — `webhook-annotation-templates` must NOT appear in `daemon.yaml`:**
 viper's YAML parsing path calls `insensitiviseMap`, which recursively lowercases all map keys. This corrupts annotation key casing (`var.PVName` → `var.pvname`). The flag is delivered exclusively as a CLI argument (rendered by Helm from `values.yaml`), which routes through pflag's `stringToString` CSV parser and preserves casing.
